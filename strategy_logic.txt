@@ -1,0 +1,149 @@
+Indian Stock Momentum Scanner - Logic Notes (v1)
+================================================
+
+Purpose
+-------
+This scanner finds short-term NSE cash stocks showing momentum breakout behavior.
+Current pipeline is:
+1) Build symbol universe
+2) Fetch OHLCV data
+3) Compute indicators
+4) Apply strict rule filters
+5) Rank and output candidates
+
+
+1) Symbol Universe
+------------------
+Primary source:
+- non_fno_stocks.txt (generated dynamically by generate_non_fno_stocks.py)
+
+Main scan defaults:
+- main.py reads symbols from non_fno_stocks.txt
+- Default limit is first 200 symbols
+- Use --limit 0 to scan all symbols in file
+- --symbols can override file and scan any custom comma-separated list
+
+Fallback:
+- If symbols file is missing/empty, code falls back to DEFAULT_STOCKS in scanner/config.py
+
+
+2) Data Fetching Rules
+----------------------
+Module:
+- scanner/data_fetcher.py
+
+Data provider:
+- yfinance
+
+Symbol mapping:
+- Appends .NS automatically (example: RELIANCE -> RELIANCE.NS)
+
+Data pulled:
+- Daily candles (1d interval)
+- OHLCV columns required: Open, High, Low, Close, Volume
+- Lookback window from ScannerConfig.lookback_days (default 90; use 250+ for ma200)
+
+Error handling:
+- Empty/invalid/missing data is skipped
+- Exceptions are logged and scanner continues with next symbol
+
+
+3) Indicators Computed
+----------------------
+Module:
+- scanner/indicators.py
+
+Computed columns:
+- ma20 = 20-day moving average of Close
+- ma200 = 200-day moving average of Close
+- avg_vol20 = 20-day average Volume
+- high20_prev = previous 20-day highest High
+  (uses rolling max shifted by 1 day, so today's candle is excluded)
+- rsi = RSI(14) from ta library
+- turnover = Close * Volume
+- avg_turnover20 = 20-day average turnover
+
+
+4) Filtering / Entry Rules
+--------------------------
+Module:
+- scanner/strategy.py (evaluate_symbol)
+
+A stock passes only if ALL rules are true on latest candle:
+
+Rule 1: Breakout
+- Close > high20_prev
+
+Rule 2: Volume expansion
+- (Volume / avg_vol20) >= 2.0
+
+Rule 3: RSI zone
+- 55 <= RSI <= 70
+
+Rule 4: Trend support (20-day)
+- Close > ma20
+
+Rule 5: Trend support (200-day, optional)
+- Close > ma200 when lookback >= 200 days (otherwise skipped)
+
+Rule 6: Liquidity / tradability
+- avg_turnover20 >= 5 crore INR
+  (5 crore = 5e7 rupees)
+
+Warm-up guard:
+- If latest row has NaN in required indicator fields, symbol is skipped
+
+
+5) Ranking / Output
+-------------------
+Ranking:
+- Candidates are sorted descending by volume_breakout ratio
+  where volume_breakout = Volume / avg_vol20
+
+Displayed fields:
+- symbol, close, high20_prev, volume, avg_vol20, volume_breakout, rsi, ma20, ma200, avg_turnover20_cr
+
+Progress logging:
+- Per-symbol progress in format:
+  Scanning X/N: SYMBOL
+- Also logs match/no-match status for each symbol
+
+
+6) Config Knobs (Current)
+-------------------------
+Defined in scanner/config.py -> ScannerConfig:
+- lookback_days (default 90)
+- breakout_window (20)
+- rsi_window (14)
+- ma_window (20)
+- ma200_window (200)
+- min_rsi (55)
+- max_rsi (70)
+- min_volume_multiplier (2.0)
+- min_turnover_inr (5e7)
+
+Runtime options in main.py:
+- --symbols
+- --symbols-file
+- --limit
+- --lookback-days
+- --log-level
+
+
+7) Suggested Next Parameters You Can Add
+----------------------------------------
+Easy additions for version 2:
+- Minimum price filter (avoid penny stocks)
+- Maximum ATR% filter (avoid extreme volatility)
+- Relative strength vs NIFTY over last N days
+- Gap-up limit (avoid exhausted breakout gaps)
+- Delivery percentage filter (if data source added)
+- Sector filter / blacklist
+- Minimum breakout distance (% above high20_prev)
+- Cooldown rule (exclude stocks triggered recently)
+
+Best place to add new rules:
+- scanner/strategy.py -> evaluate_symbol()
+Best place to add user-configurable values:
+- scanner/config.py + CLI args in main.py
+

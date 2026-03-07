@@ -1,0 +1,121 @@
+{
+  "info": {
+    "_postman_id": "6fcb115d-263a-4b0d-983d-2d0065dca4f3",
+    "name": "Indian Stock Scanner API",
+    "description": "Postman collection for Flask-based NSE momentum scanner APIs.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:5000"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health Check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/health",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "health"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Generate Non-F&O Symbols",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"output_file\": \"non_fno_stocks.txt\",\n  \"include_symbols\": false,\n  \"force_refresh\": false\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/symbols/non-fno/generate",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "symbols",
+            "non-fno",
+            "generate"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Run Scan (File Based)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"symbols_file\": \"non_fno_stocks.txt\",\n  \"limit\": 200,\n  \"lookback_days\": 90,\n  \"filters\": {\n    \"breakout_window\": 20,\n    \"rsi_window\": 14,\n    \"ma_window\": 20,\n    \"min_rsi\": 55,\n    \"max_rsi\": 70,\n    \"min_volume_multiplier\": 2.0,\n    \"min_turnover_inr\": 50000000\n  }\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/scan",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "scan"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Run Scan (Custom Symbols)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"symbols\": [\"RELIANCE\", \"TCS\", \"INFY\", \"SBIN\"],\n  \"lookback_days\": 90\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/scan",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "scan"
+          ]
+        }
+      },
+      "response": []
+    }
+  ]
+}
