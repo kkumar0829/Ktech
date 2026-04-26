@@ -1,7 +1,6 @@
 import os
 import logging
 import threading
-import uuid
 from dataclasses import asdict
 from datetime import date, datetime
 from pathlib import Path
@@ -25,10 +24,14 @@ setup_logging(level=logging.INFO)
 
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
+_job_counter = 0
 
 
 def _new_job() -> str:
-    job_id = str(uuid.uuid4())
+    global _job_counter
+    with _jobs_lock:
+        _job_counter += 1
+        job_id = str(_job_counter)
     with _jobs_lock:
         _jobs[job_id] = {"status": "pending", "created_at": datetime.utcnow().isoformat()}
     return job_id
@@ -42,6 +45,32 @@ def _update_job(job_id: str, **kwargs: Any) -> None:
 def _get_job(job_id: str) -> dict[str, Any] | None:
     with _jobs_lock:
         return dict(_jobs.get(job_id, {}))
+
+
+def _payload_from_request() -> dict[str, Any]:
+    """Support both GET query params and POST JSON body.
+
+    Chrome-friendly:
+    - GET /api/v1/scan?as_of=YYYY-MM-DD&b=2
+    """
+    if request.method == "GET":
+        payload: dict[str, Any] = {}
+        for key in request.args:
+            payload[key] = request.args.get(key)
+        return payload
+    return _json_payload()
+
+
+def _batch_params(payload: dict[str, Any]) -> tuple[int, int, int]:
+    """Return (batch, limit, offset) for 2-batch scanning."""
+    raw_b = str(payload.get("b", "")).strip()
+    batch = int(raw_b) if raw_b else 1
+    if batch not in (1, 2):
+        raise ValueError("b must be 1 or 2")
+
+    limit = 950
+    offset = 0 if batch == 1 else 950
+    return batch, limit, offset
 
 
 # ---------------------------------------------------------------------------
@@ -120,8 +149,8 @@ def _log_scan_results(scanned: int, matched: int, results: list[dict[str, Any]])
 
 def _resolve_symbols_from_payload(payload: dict[str, Any]) -> list[str]:
     symbols_file = str(payload.get("symbols_file", "non_fno_stocks.txt"))
-    limit = int(payload.get("limit", 200))
-    offset = int(payload.get("offset", 0))
+    # Only support 2 batches (Chrome friendly): b=1 or b=2
+    _, limit, offset = _batch_params(payload)
     return resolve_symbols(symbols_file=symbols_file, limit=limit, offset=offset)
 
 
@@ -162,6 +191,9 @@ def _run_scan_job(job_id: str, symbols: list[str], config: ScannerConfig, as_of:
                 "results": result_rows,
                 "applied_config": asdict(config),
                 "as_of": as_of.isoformat() if as_of else None,
+                "batch": _get_job(job_id).get("batch") if _get_job(job_id) else None,
+                "limit": _get_job(job_id).get("limit") if _get_job(job_id) else None,
+                "offset": _get_job(job_id).get("offset") if _get_job(job_id) else None,
             },
         )
         logging.info("[job:%s] Done — matched %d/%d", job_id, len(result_rows), len(symbols))
@@ -185,22 +217,23 @@ def health() -> Any:
     return jsonify({"success": True, "message": "Service is healthy"}), 200
 
 
+@app.get("/api/v1/scan")
 @app.post("/api/v1/scan")
 def scan_start() -> Any:
     """Start an async scan.  Returns a job_id immediately.
     Poll GET /api/v1/scan/<job_id> for progress / results.
     """
     try:
-        payload = _json_payload()
-        config = _build_config(payload)
+        payload = _payload_from_request()
+        config = _build_config({})
         symbols = _resolve_symbols_from_payload(payload)
         as_of = _as_of_from_payload(payload)
-        offset = int(payload.get("offset", 0))
+        batch, limit, offset = _batch_params(payload)
     except ValueError as exc:
         return jsonify({"success": False, "message": "Invalid request payload.", "error": str(exc)}), 400
 
     job_id = _new_job()
-    _update_job(job_id, offset=offset, total_in_chunk=len(symbols))
+    _update_job(job_id, batch=batch, limit=limit, offset=offset, total_in_chunk=len(symbols))
     t = threading.Thread(target=_run_scan_job, args=(job_id, symbols, config, as_of), daemon=True)
     t.start()
 
@@ -211,6 +244,9 @@ def scan_start() -> Any:
                 "message": "Scan started. Poll the status endpoint for results.",
                 "job_id": job_id,
                 "status_url": f"/api/v1/scan/{job_id}",
+                "batch": batch,
+                "limit": limit,
+                "offset": offset,
             }
         ),
         202,
