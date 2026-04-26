@@ -17,8 +17,10 @@ def read_symbols_from_file(file_path: str) -> List[str]:
 def resolve_symbols(
     symbols_file: str = "non_fno_stocks.txt",
     limit: int = 200,
+    offset: int = 0,
 ) -> List[str]:
     file_symbols = read_symbols_from_file(symbols_file)
+    sliced = file_symbols[offset:] if offset > 0 else file_symbols
     if limit > 0:
-        return file_symbols[:limit]
-    return file_symbols
+        return sliced[:limit]
+    return sliced

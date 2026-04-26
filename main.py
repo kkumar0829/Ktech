@@ -121,7 +121,8 @@ def _log_scan_results(scanned: int, matched: int, results: list[dict[str, Any]])
 def _resolve_symbols_from_payload(payload: dict[str, Any]) -> list[str]:
     symbols_file = str(payload.get("symbols_file", "non_fno_stocks.txt"))
     limit = int(payload.get("limit", 200))
-    return resolve_symbols(symbols_file=symbols_file, limit=limit)
+    offset = int(payload.get("offset", 0))
+    return resolve_symbols(symbols_file=symbols_file, limit=limit, offset=offset)
 
 
 def _as_of_from_payload(payload: dict[str, Any]) -> date | None:
@@ -194,10 +195,12 @@ def scan_start() -> Any:
         config = _build_config(payload)
         symbols = _resolve_symbols_from_payload(payload)
         as_of = _as_of_from_payload(payload)
+        offset = int(payload.get("offset", 0))
     except ValueError as exc:
         return jsonify({"success": False, "message": "Invalid request payload.", "error": str(exc)}), 400
 
     job_id = _new_job()
+    _update_job(job_id, offset=offset, total_in_chunk=len(symbols))
     t = threading.Thread(target=_run_scan_job, args=(job_id, symbols, config, as_of), daemon=True)
     t.start()
 
