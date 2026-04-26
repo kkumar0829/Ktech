@@ -8,7 +8,7 @@ class ScannerConfig:
     breakout_window: int = 20
     rsi_window: int = 14
     ma_window: int = 20
-    ma200_window: int = 200
+    ma50_window: int = 50
     min_rsi: float = 55.0
     max_rsi: float = 70.0
     min_volume_multiplier: float = 2.0

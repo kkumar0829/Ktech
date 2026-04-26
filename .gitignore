@@ -21,3 +21,8 @@ build/
 
 # Logs (optional - remove if you want to track scan history)
 scan_results.log
+
+# Lambda build artifacts
+lambda_build/
+lambda_package/
+lambda_deploy.zip

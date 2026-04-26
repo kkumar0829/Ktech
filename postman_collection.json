@@ -32,36 +32,6 @@
       "response": []
     },
     {
-      "name": "Generate Non-F&O Symbols",
-      "request": {
-        "method": "POST",
-        "header": [
-          {
-            "key": "Content-Type",
-            "value": "application/json"
-          }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"output_file\": \"non_fno_stocks.txt\",\n  \"include_symbols\": false,\n  \"force_refresh\": false\n}"
-        },
-        "url": {
-          "raw": "{{baseUrl}}/api/v1/symbols/non-fno/generate",
-          "host": [
-            "{{baseUrl}}"
-          ],
-          "path": [
-            "api",
-            "v1",
-            "symbols",
-            "non-fno",
-            "generate"
-          ]
-        }
-      },
-      "response": []
-    },
-    {
       "name": "Run Scan (File Based)",
       "request": {
         "method": "POST",
@@ -90,7 +60,7 @@
       "response": []
     },
     {
-      "name": "Run Scan (Custom Symbols)",
+      "name": "Run Scan (File Based - Full Universe)",
       "request": {
         "method": "POST",
         "header": [
@@ -101,7 +71,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"symbols\": [\"RELIANCE\", \"TCS\", \"INFY\", \"SBIN\"],\n  \"lookback_days\": 90\n}"
+          "raw": "{\n  \"symbols_file\": \"non_fno_stocks.txt\",\n  \"limit\": 0,\n  \"lookback_days\": 90\n}"
         },
         "url": {
           "raw": "{{baseUrl}}/api/v1/scan",

@@ -55,28 +55,7 @@ http://localhost:5000
 GET /api/v1/health
 ```
 
-### 2) Generate non-F&O symbol file
-
-```http
-POST /api/v1/symbols/non-fno/generate
-Content-Type: application/json
-```
-
-Request body (optional):
-
-```json
-{
-  "output_file": "non_fno_stocks.txt",
-  "include_symbols": false,
-  "force_refresh": false
-}
-```
-
-Notes:
-- If file already exists and `force_refresh` is `false`, API reuses existing symbols file.
-- Set `force_refresh: true` only when you want to fetch fresh NSE symbols again.
-
-### 3) Run momentum scan
+### 2) Run momentum scan
 
 ```http
 POST /api/v1/scan
@@ -103,7 +82,8 @@ You can also pass symbols directly:
 
 ```json
 {
-  "symbols": ["RELIANCE", "TCS", "INFY"],
+  "symbols_file": "non_fno_stocks.txt",
+  "limit": 200,
   "lookback_days": 90
 }
 ```
@@ -128,3 +108,27 @@ Response shape:
 - Use NSE symbols without `.NS`; code appends it internally.
 - Results are sorted by strongest volume breakout (`volume / avg_vol20`).
 - `scan_symbols()` and `ScanResult` are intentionally separated to keep it easy to plug into a future backtest module.
+
+### 3) SMC Fair Value Gap (FVG) analysis (1H + 15M)
+
+```http
+POST /api/v1/smc/fvg
+Content-Type: application/json
+```
+
+Request body:
+
+```json
+{
+  "1H": [
+    { "timestamp": "2026-01-01T10:00:00Z", "open": 0, "high": 0, "low": 0, "close": 0 }
+  ],
+  "15M": [
+    { "timestamp": "2026-01-01T10:00:00Z", "open": 0, "high": 0, "low": 0, "close": 0 }
+  ]
+}
+```
+
+Response:
+- Always returns JSON with `bias_1H`, `fvgs_1H`, `fvgs_15M_aligned`, and `setup`.
+- `setup` is `null` when no strict setup is detected.
