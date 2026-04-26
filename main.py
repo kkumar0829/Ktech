@@ -1,5 +1,7 @@
 import os
 import logging
+import threading
+import uuid
 from dataclasses import asdict
 from datetime import date, datetime
 from pathlib import Path
@@ -15,6 +17,36 @@ from scanner.rules import analyze_smc_fvg, results_to_dataframe, scan_symbols
 app = Flask(__name__)
 
 setup_logging(level=logging.INFO)
+
+
+# ---------------------------------------------------------------------------
+# In-memory async job store  (lives as long as the process, single-worker)
+# ---------------------------------------------------------------------------
+
+_jobs: dict[str, dict[str, Any]] = {}
+_jobs_lock = threading.Lock()
+
+
+def _new_job() -> str:
+    job_id = str(uuid.uuid4())
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "pending", "created_at": datetime.utcnow().isoformat()}
+    return job_id
+
+
+def _update_job(job_id: str, **kwargs: Any) -> None:
+    with _jobs_lock:
+        _jobs[job_id].update(kwargs)
+
+
+def _get_job(job_id: str) -> dict[str, Any] | None:
+    with _jobs_lock:
+        return dict(_jobs.get(job_id, {}))
+
+
+# ---------------------------------------------------------------------------
+# Request helpers
+# ---------------------------------------------------------------------------
 
 
 def _json_payload() -> dict[str, Any]:
@@ -58,12 +90,7 @@ def _build_config(payload: dict[str, Any]) -> ScannerConfig:
 SCAN_RESULTS_LOG = Path(__file__).parent / "scan_results.log"
 
 
-def _log_scan_results(
-    scanned: int,
-    matched: int,
-    results: list[dict[str, Any]],
-) -> None:
-    """Append scan result to log file with datetime."""
+def _log_scan_results(scanned: int, matched: int, results: list[dict[str, Any]]) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [
         "",
@@ -72,7 +99,9 @@ def _log_scan_results(
         "-" * 70,
     ]
     if results:
-        lines.append(f"{'symbol':<12} {'close':>10} {'ma50':>10} {'vol_breakout':>12} {'rsi':>8} {'avg_turnover20_cr':>18}")
+        lines.append(
+            f"{'symbol':<12} {'close':>10} {'ma50':>10} {'vol_breakout':>12} {'rsi':>8} {'avg_turnover20_cr':>18}"
+        )
         for r in results:
             lines.append(
                 f"{str(r.get('symbol','')):<12} "
@@ -105,68 +134,135 @@ def _as_of_from_payload(payload: dict[str, Any]) -> date | None:
         raise ValueError("as_of must be YYYY-MM-DD") from exc
 
 
+# ---------------------------------------------------------------------------
+# Background worker for the long-running scan
+# ---------------------------------------------------------------------------
+
+
+def _run_scan_job(job_id: str, symbols: list[str], config: ScannerConfig, as_of: date | None) -> None:
+    _update_job(job_id, status="running", started_at=datetime.utcnow().isoformat())
+    try:
+        logging.info("[job:%s] Scanning %d symbols", job_id, len(symbols))
+        results = scan_symbols(symbols, config, as_of=as_of)
+        result_rows = results_to_dataframe(results).to_dict(orient="records")
+
+        try:
+            _log_scan_results(len(symbols), len(result_rows), result_rows)
+        except Exception as exc:
+            logging.warning("[job:%s] Failed to write scan log: %s", job_id, exc)
+
+        _update_job(
+            job_id,
+            status="done",
+            finished_at=datetime.utcnow().isoformat(),
+            data={
+                "scanned_symbols": len(symbols),
+                "matched_symbols": len(result_rows),
+                "results": result_rows,
+                "applied_config": asdict(config),
+                "as_of": as_of.isoformat() if as_of else None,
+            },
+        )
+        logging.info("[job:%s] Done — matched %d/%d", job_id, len(result_rows), len(symbols))
+    except Exception as exc:
+        logging.exception("[job:%s] Scan failed: %s", job_id, exc)
+        _update_job(
+            job_id,
+            status="error",
+            finished_at=datetime.utcnow().isoformat(),
+            error=str(exc),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+
 @app.get("/api/v1/health")
 def health() -> Any:
     return jsonify({"success": True, "message": "Service is healthy"}), 200
 
 
 @app.post("/api/v1/scan")
-def scan() -> Any:
+def scan_start() -> Any:
+    """Start an async scan.  Returns a job_id immediately.
+    Poll GET /api/v1/scan/<job_id> for progress / results.
+    """
     try:
         payload = _json_payload()
         config = _build_config(payload)
         symbols = _resolve_symbols_from_payload(payload)
         as_of = _as_of_from_payload(payload)
+    except ValueError as exc:
+        return jsonify({"success": False, "message": "Invalid request payload.", "error": str(exc)}), 400
 
-        logging.info("Starting API scan for %d symbols", len(symbols))
-        results = scan_symbols(symbols, config, as_of=as_of)
-        results_df = results_to_dataframe(results)
-        result_rows = results_df.to_dict(orient="records")
+    job_id = _new_job()
+    t = threading.Thread(target=_run_scan_job, args=(job_id, symbols, config, as_of), daemon=True)
+    t.start()
 
-        try:
-            _log_scan_results(len(symbols), len(result_rows), result_rows)
-        except Exception as exc:
-            logging.warning("Failed to write scan results log: %s", exc)
+    return (
+        jsonify(
+            {
+                "success": True,
+                "message": "Scan started. Poll the status endpoint for results.",
+                "job_id": job_id,
+                "status_url": f"/api/v1/scan/{job_id}",
+            }
+        ),
+        202,
+    )
 
+
+@app.get("/api/v1/scan/<job_id>")
+def scan_status(job_id: str) -> Any:
+    """Poll the result of an async scan job."""
+    job = _get_job(job_id)
+    if not job:
+        return jsonify({"success": False, "message": "Job not found."}), 404
+
+    status = job.get("status")
+
+    if status == "done":
         return (
             jsonify(
                 {
                     "success": True,
+                    "status": "done",
                     "message": "Scan completed.",
-                    "data": {
-                        "scanned_symbols": len(symbols),
-                        "matched_symbols": len(result_rows),
-                        "results": result_rows,
-                        "applied_config": asdict(config),
-                        "as_of": as_of.isoformat() if as_of else None,
-                    },
+                    "job_id": job_id,
+                    "data": job.get("data"),
                 }
             ),
             200,
         )
-    except ValueError as exc:
+
+    if status == "error":
         return (
             jsonify(
                 {
                     "success": False,
-                    "message": "Invalid request payload.",
-                    "error": str(exc),
-                }
-            ),
-            400,
-        )
-    except Exception as exc:
-        logging.exception("Scan failed: %s", exc)
-        return (
-            jsonify(
-                {
-                    "success": False,
-                    "message": "Scan failed due to internal error.",
-                    "error": str(exc),
+                    "status": "error",
+                    "message": "Scan failed.",
+                    "job_id": job_id,
+                    "error": job.get("error"),
                 }
             ),
             500,
         )
+
+    # pending / running
+    return (
+        jsonify(
+            {
+                "success": True,
+                "status": status,
+                "message": "Scan is still running. Try again in a few seconds.",
+                "job_id": job_id,
+            }
+        ),
+        202,
+    )
 
 
 @app.post("/api/v1/smc/fvg")
@@ -176,27 +272,15 @@ def smc_fvg() -> Any:
         result = analyze_smc_fvg(payload)
         return jsonify(result), 200
     except ValueError as exc:
-        return (
-            jsonify(
-                {
-                    "error": "INVALID_INPUT",
-                    "message": str(exc),
-                }
-            ),
-            400,
-        )
+        return jsonify({"error": "INVALID_INPUT", "message": str(exc)}), 400
     except Exception as exc:
         logging.exception("SMC FVG analysis failed: %s", exc)
-        return (
-            jsonify(
-                {
-                    "error": "INTERNAL_ERROR",
-                    "message": str(exc),
-                }
-            ),
-            500,
-        )
+        return jsonify({"error": "INTERNAL_ERROR", "message": str(exc)}), 500
 
+
+# ---------------------------------------------------------------------------
+# Dev entrypoint (not used by Gunicorn on Render)
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import socket

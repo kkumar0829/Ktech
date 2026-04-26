@@ -1,73 +1,90 @@
 # Indian Stock Momentum Scanner (NSE Cash)
 
-Simple, modular Python scanner to detect short-term breakout candidates using:
+Modular Python scanner to detect short-term breakout candidates using daily momentum + SMC/FVG bias + Anchored VWAP swing signal.
 
-- Close > previous 20-day high
-- Volume > 2x 20-day average volume
-- RSI between 55 and 70
-- Close above 20-day moving average
-- 20-day average turnover >= 5 crore INR
+## Signals in every matched result
+
+| Key | Values | Purpose |
+|---|---|---|
+| `bias_1h` | BULLISH / BEARISH / NEUTRAL | SMC FVG bias on 1H timeframe |
+| `bias_15m` | BULLISH / BEARISH / NEUTRAL | SMC FVG bias on 15M timeframe |
+| `avwap_signal` | BUY / SELL / NEUTRAL | 1-day vs 2-day Anchored VWAP crossover (swing, info only) |
 
 ## Project Structure
 
 ```text
 .
 ├── main.py
+├── render.yaml
 ├── requirements.txt
+├── tas_rules.md
+├── non_fno_stocks.txt
 └── scanner/
     ├── __init__.py
     ├── config.py
     ├── data_fetcher.py
-    ├── indicators.py
     ├── logger.py
-    ├── runner.py
-    └── strategy.py
+    ├── rules.py          ← all rule logic lives here
+    └── symbol_loader.py
 ```
 
-## Setup
-
-1. Activate your virtual environment.
-2. Install dependencies:
+## Local Setup
 
 ```bash
+python -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
+PORT=5001 python main.py
 ```
 
-## Run Flask API
+## Deploy on Render
 
-Start server:
+1. Push this repo to GitHub.
+2. Go to [render.com](https://render.com) → **New → Web Service** → connect your repo.
+3. Render auto-detects `render.yaml` — just click **Deploy**.
+4. Your service URL will be something like `https://indian-stock-scanner.onrender.com`.
 
-```bash
-python3 main.py
-```
-
-Base URL:
-
-```text
-http://localhost:5000
-```
+> **Free plan note**: Render free instances spin down after inactivity. Use the **Starter** plan ($7/mo) to keep it always-on.
 
 ## API Endpoints
 
-### 1) Health Check
+### 1. Health Check
 
 ```http
 GET /api/v1/health
 ```
 
-### 2) Run momentum scan
+Response: `{ "success": true, "message": "Service is healthy" }`
+
+---
+
+### 2. Start a Scan (async — returns immediately)
+
+The full scan takes ~5 minutes. The API returns a `job_id` right away so Render's HTTP timeout is never hit.
 
 ```http
 POST /api/v1/scan
 Content-Type: application/json
 ```
 
-Sample request:
+Minimal payload (scan today's data, all defaults):
+
+```json
+{}
+```
+
+Historical scan:
+
+```json
+{ "as_of": "2026-04-16" }
+```
+
+Full payload:
 
 ```json
 {
-  "symbols_file": "non_fno_stocks.txt",
-  "limit": 200,
+  "as_of": "2026-04-16",
+  "limit": 0,
   "lookback_days": 90,
   "filters": {
     "min_rsi": 55,
@@ -78,45 +95,66 @@ Sample request:
 }
 ```
 
-You can also pass symbols directly:
-
-```json
-{
-  "symbols_file": "non_fno_stocks.txt",
-  "limit": 200,
-  "lookback_days": 90
-}
-```
-
-Response shape:
+Response (202 Accepted — scan is running in background):
 
 ```json
 {
   "success": true,
-  "message": "Scan completed.",
+  "message": "Scan started. Poll the status endpoint for results.",
+  "job_id": "a1b2c3d4-...",
+  "status_url": "/api/v1/scan/a1b2c3d4-..."
+}
+```
+
+---
+
+### 3. Poll Scan Results
+
+```http
+GET /api/v1/scan/{job_id}
+```
+
+**While running** (202):
+```json
+{ "success": true, "status": "running", "job_id": "..." }
+```
+
+**When done** (200):
+```json
+{
+  "success": true,
+  "status": "done",
+  "job_id": "...",
   "data": {
-    "scanned_symbols": 200,
-    "matched_symbols": 3,
-    "results": [],
-    "applied_config": {}
+    "scanned_symbols": 1900,
+    "matched_symbols": 14,
+    "results": [
+      {
+        "symbol": "FSL",
+        "close": 244.22,
+        "rsi": 60.07,
+        "volume_breakout": 14.63,
+        "bias_1h": "BULLISH",
+        "bias_15m": "NEUTRAL",
+        "avwap_signal": "BUY"
+      }
+    ],
+    "applied_config": {},
+    "as_of": "2026-04-16"
   }
 }
 ```
 
-## Notes
+**Typical polling interval**: every 10–15 seconds until `status == "done"`.
 
-- Use NSE symbols without `.NS`; code appends it internally.
-- Results are sorted by strongest volume breakout (`volume / avg_vol20`).
-- `scan_symbols()` and `ScanResult` are intentionally separated to keep it easy to plug into a future backtest module.
+---
 
-### 3) SMC Fair Value Gap (FVG) analysis (1H + 15M)
+### 4. SMC Fair Value Gap (FVG) Analysis
 
 ```http
 POST /api/v1/smc/fvg
 Content-Type: application/json
 ```
-
-Request body:
 
 ```json
 {
@@ -129,6 +167,11 @@ Request body:
 }
 ```
 
-Response:
-- Always returns JSON with `bias_1H`, `fvgs_1H`, `fvgs_15M_aligned`, and `setup`.
-- `setup` is `null` when no strict setup is detected.
+Returns `bias_1H`, detected `fvgs_1H`, and aligned `fvgs_15M_aligned`.
+
+## Notes
+
+- NSE symbols are passed **without** `.NS` — the code appends it internally.
+- Results are sorted by strongest volume breakout (`volume / avg_vol20`).
+- `avwap_signal` and bias keys are **informational only** — they do not filter stocks in/out.
+- See `tas_rules.md` for the exact rule definitions.

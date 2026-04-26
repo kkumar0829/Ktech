@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: indian-stock-scanner
+    env: python
+    region: singapore   # closest to NSE/India data sources
+    plan: starter       # upgrade to standard for more RAM if needed
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --workers 1 --threads 4 --timeout 30 --bind 0.0.0.0:$PORT main:app
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
