@@ -45,8 +45,27 @@
         </div>
       </form>
 
+      <hr style="border: 0; border-top: 1px solid #e5e7eb; margin: 14px 0;" />
+
+      <form action="/ui/job" method="get">
+        <div class="row">
+          <div>
+            <label>open past job</label>
+            <select name="job_id">
+              <option value="">Select job id…</option>
+              {% for jid in (recent_job_ids or []) %}
+                <option value="{{ jid }}">{{ jid }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div>
+            <button type="submit">Open</button>
+          </div>
+        </div>
+      </form>
+
       <div class="muted">
-        - Start scan opens a new page like <code>/ui/job/12</code> and auto-refreshes while running.<br/>
+        - Start scan opens a new page like <code>/ui/12</code> and auto-refreshes while running.<br/>
         - API still works at <code>/api/v1/scan</code> and <code>/api/v1/scan/&lt;id&gt;</code>.
       </div>
     </div>

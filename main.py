@@ -90,6 +90,28 @@ def _read_record_from_store(job_id: str) -> dict[str, Any] | None:
     return None
 
 
+def _list_job_ids_from_store(*, limit: int = 50) -> list[str]:
+    """Return newest-first job_ids from the store file."""
+    if not _RESULTS_STORE_FILE.exists():
+        return []
+    out: list[str] = []
+    try:
+        for ln in _RESULTS_STORE_FILE.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            obj = json.loads(ln)
+            jid = obj.get("job_id")
+            if jid is None:
+                continue
+            out.append(str(jid))
+            if len(out) >= limit:
+                break
+    except Exception:
+        return out
+    return out
+
+
 def _new_job() -> str:
     global _job_counter
     with _jobs_lock:
@@ -351,7 +373,15 @@ def ui_home() -> Any:
     if job_id:
         job = _read_record_from_store(job_id) or _get_job(job_id)
 
-    return render_template("ui.html", as_of=as_of, b=b, job_id=job_id, job=job)
+    recent_job_ids = _list_job_ids_from_store(limit=50)
+    return render_template(
+        "ui.html",
+        as_of=as_of,
+        b=b,
+        job_id=job_id,
+        job=job,
+        recent_job_ids=recent_job_ids,
+    )
 
 
 @app.get("/ui/start")
@@ -380,6 +410,15 @@ def ui_start() -> Any:
     return redirect(url_for("ui_job", job_id=job_id))
 
 
+@app.get("/ui/job")
+def ui_job_picker() -> Any:
+    job_id = request.args.get("job_id", "").strip()
+    if not job_id:
+        return redirect(url_for("ui_home"))
+    return redirect(url_for("ui_job", job_id=job_id))
+
+
+@app.get("/ui/<job_id>")
 @app.get("/ui/job/<job_id>")
 def ui_job(job_id: str) -> Any:
     job = _read_record_from_store(job_id) or _get_job(job_id)
