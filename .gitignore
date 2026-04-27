@@ -22,6 +22,10 @@ build/
 # Logs (optional - remove if you want to track scan history)
 scan_results.log
 
+# Runtime state (Render / local)
+job_counter.txt
+scan_results_store.jsonl
+
 # Lambda build artifacts
 lambda_build/
 lambda_package/

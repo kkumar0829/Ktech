@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Scan Job {{ job_id }}</title>
+    {% if status in ["pending", "running"] %}
+      <meta http-equiv="refresh" content="5" />
+    {% endif %}
+    <style>
+      body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
+      .top { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+      a { text-decoration: none; color: #111827; }
+      .pill { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 12px; }
+      .ok { background: #dcfce7; color: #166534; }
+      .run { background: #e0f2fe; color: #075985; }
+      .err { background: #fee2e2; color: #991b1b; }
+      .muted { color: #6b7280; font-size: 12px; }
+      table { border-collapse: collapse; width: 100%; margin-top: 14px; }
+      th, td { border-bottom: 1px solid #e5e7eb; padding: 8px 10px; font-size: 13px; text-align: left; }
+      th { position: sticky; top: 0; background: white; }
+      .wrap { max-width: 1200px; }
+      code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="top">
+        <a href="/ui">← Back</a>
+        <div>Job <code>{{ job_id }}</code></div>
+        {% if status == "done" %}
+          <span class="pill ok">done</span>
+        {% elif status in ["pending", "running"] %}
+          <span class="pill run">{{ status }}</span>
+        {% elif status == "error" %}
+          <span class="pill err">error</span>
+        {% else %}
+          <span class="pill">{{ status }}</span>
+        {% endif %}
+        {% if status in ["pending", "running"] %}
+          <div class="muted">Auto-refreshing every 5s…</div>
+        {% endif %}
+      </div>
+
+      {% if status == "not_found" %}
+        <p>Job not found.</p>
+      {% endif %}
+
+      {% if status == "error" %}
+        <p><b>Error:</b> {{ job.get("error") if job else "" }}</p>
+      {% endif %}
+
+      {% if data and data.get("results") %}
+        <div class="muted">
+          scanned: {{ data.get("scanned_symbols") }} |
+          matched: {{ data.get("matched_symbols") }} |
+          as_of: {{ data.get("as_of") }} |
+          batch: {{ data.get("batch") }} |
+          offset: {{ data.get("offset") }}
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>symbol</th>
+              <th>close</th>
+              <th>volume_breakout</th>
+              <th>rsi</th>
+              <th>avg_turnover20_cr</th>
+              <th>bias_1h</th>
+              <th>bias_15m</th>
+              <th>avwap_signal</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for r in data.get("results") %}
+              <tr>
+                <td>{{ r.get("symbol") }}</td>
+                <td>{{ r.get("close") }}</td>
+                <td>{{ r.get("volume_breakout") }}</td>
+                <td>{{ r.get("rsi") }}</td>
+                <td>{{ r.get("avg_turnover20_cr") }}</td>
+                <td>{{ r.get("bias_1h") }}</td>
+                <td>{{ r.get("bias_15m") }}</td>
+                <td>{{ r.get("avwap_signal") }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% elif status in ["pending", "running"] %}
+        <p>Scan is running…</p>
+      {% elif status == "done" %}
+        <p>No matches.</p>
+      {% endif %}
+    </div>
+  </body>
+</html>
+

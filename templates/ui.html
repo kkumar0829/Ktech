@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ktech Scanner UI</title>
+    <style>
+      :root { color-scheme: light; }
+      body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
+      .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; max-width: 1000px; }
+      h1 { font-size: 18px; margin: 0 0 12px 0; }
+      .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
+      label { display: block; font-size: 12px; color: #374151; margin-bottom: 6px; }
+      input, select { padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 10px; min-width: 180px; }
+      button, a.btn { background: #111827; color: white; border: 0; padding: 9px 12px; border-radius: 10px; text-decoration: none; display: inline-block; }
+      .muted { color: #6b7280; font-size: 12px; margin-top: 10px; }
+      .error { color: #b91c1c; font-size: 13px; margin-top: 10px; }
+      code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Ktech Stock Scanner</h1>
+
+      {% if error %}
+        <div class="error">{{ error }}</div>
+      {% endif %}
+
+      <form action="/ui/start" method="get">
+        <div class="row">
+          <div>
+            <label>as_of (optional)</label>
+            <input name="as_of" placeholder="YYYY-MM-DD" value="{{ as_of }}" />
+          </div>
+          <div>
+            <label>batch</label>
+            <select name="b">
+              <option value="1" {% if b == "1" %}selected{% endif %}>1 (first 950)</option>
+              <option value="2" {% if b == "2" %}selected{% endif %}>2 (next 950)</option>
+            </select>
+          </div>
+          <div>
+            <button type="submit">Start scan</button>
+          </div>
+        </div>
+      </form>
+
+      <div class="muted">
+        - Start scan opens a new page like <code>/ui/job/12</code> and auto-refreshes while running.<br/>
+        - API still works at <code>/api/v1/scan</code> and <code>/api/v1/scan/&lt;id&gt;</code>.
+      </div>
+    </div>
+  </body>
+</html>
+

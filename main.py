@@ -1,12 +1,13 @@
 import os
 import logging
 import threading
+import json
 from dataclasses import asdict
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, render_template, redirect, url_for
 
 from scanner.config import ScannerConfig
 from scanner.logger import setup_logging
@@ -27,12 +28,76 @@ _jobs_lock = threading.Lock()
 _job_counter = 0
 
 
+_STATE_DIR = Path(os.getenv("STATE_DIR", Path(__file__).parent))
+_COUNTER_FILE = _STATE_DIR / "job_counter.txt"
+_RESULTS_STORE_FILE = _STATE_DIR / "scan_results_store.jsonl"  # newest-first JSONL, keep last 50
+
+
+def _ensure_state_dir() -> None:
+    try:
+        _STATE_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # best-effort; Render's filesystem is writable for the service runtime
+        pass
+
+
+def _load_counter_from_file() -> int:
+    _ensure_state_dir()
+    try:
+        raw = _COUNTER_FILE.read_text(encoding="utf-8").strip()
+        return int(raw) if raw else 0
+    except Exception:
+        return 0
+
+
+def _persist_counter_to_file(value: int) -> None:
+    _ensure_state_dir()
+    tmp = _COUNTER_FILE.with_suffix(".tmp")
+    tmp.write_text(str(value), encoding="utf-8")
+    tmp.replace(_COUNTER_FILE)
+
+
+def _store_prepend_record(record: dict[str, Any], *, keep: int = 50) -> None:
+    """Store newest-first JSONL, keep only N records (LIFO)."""
+    _ensure_state_dir()
+    line = json.dumps(record, ensure_ascii=False)
+    existing: list[str] = []
+    if _RESULTS_STORE_FILE.exists():
+        try:
+            existing = [ln for ln in _RESULTS_STORE_FILE.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        except Exception:
+            existing = []
+    new_lines = [line] + existing[: max(0, keep - 1)]
+    tmp = _RESULTS_STORE_FILE.with_suffix(".tmp")
+    tmp.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
+    tmp.replace(_RESULTS_STORE_FILE)
+
+
+def _read_record_from_store(job_id: str) -> dict[str, Any] | None:
+    """Read a job record from the results store file (newest-first)."""
+    if not _RESULTS_STORE_FILE.exists():
+        return None
+    try:
+        for ln in _RESULTS_STORE_FILE.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            obj = json.loads(ln)
+            if str(obj.get("job_id")) == str(job_id):
+                return obj
+    except Exception:
+        return None
+    return None
+
+
 def _new_job() -> str:
     global _job_counter
     with _jobs_lock:
+        if _job_counter <= 0:
+            _job_counter = _load_counter_from_file()
         _job_counter += 1
         job_id = str(_job_counter)
-    with _jobs_lock:
+        _persist_counter_to_file(_job_counter)
         _jobs[job_id] = {"status": "pending", "created_at": datetime.utcnow().isoformat()}
     return job_id
 
@@ -172,6 +237,7 @@ def _as_of_from_payload(payload: dict[str, Any]) -> date | None:
 def _run_scan_job(job_id: str, symbols: list[str], config: ScannerConfig, as_of: date | None) -> None:
     _update_job(job_id, status="running", started_at=datetime.utcnow().isoformat())
     try:
+        job_snapshot = _get_job(job_id) or {}
         logging.info("[job:%s] Scanning %d symbols", job_id, len(symbols))
         results = scan_symbols(symbols, config, as_of=as_of)
         result_rows = results_to_dataframe(results).to_dict(orient="records")
@@ -181,29 +247,45 @@ def _run_scan_job(job_id: str, symbols: list[str], config: ScannerConfig, as_of:
         except Exception as exc:
             logging.warning("[job:%s] Failed to write scan log: %s", job_id, exc)
 
-        _update_job(
-            job_id,
-            status="done",
-            finished_at=datetime.utcnow().isoformat(),
-            data={
-                "scanned_symbols": len(symbols),
-                "matched_symbols": len(result_rows),
-                "results": result_rows,
-                "applied_config": asdict(config),
-                "as_of": as_of.isoformat() if as_of else None,
-                "batch": _get_job(job_id).get("batch") if _get_job(job_id) else None,
-                "limit": _get_job(job_id).get("limit") if _get_job(job_id) else None,
-                "offset": _get_job(job_id).get("offset") if _get_job(job_id) else None,
-            },
+        data = {
+            "scanned_symbols": len(symbols),
+            "matched_symbols": len(result_rows),
+            "results": result_rows,
+            "applied_config": asdict(config),
+            "as_of": as_of.isoformat() if as_of else None,
+            "batch": job_snapshot.get("batch"),
+            "limit": job_snapshot.get("limit"),
+            "offset": job_snapshot.get("offset"),
+        }
+        _update_job(job_id, status="done", finished_at=datetime.utcnow().isoformat(), data=data)
+
+        _store_prepend_record(
+            {
+                "job_id": job_id,
+                "status": "done",
+                "created_at": job_snapshot.get("created_at"),
+                "started_at": job_snapshot.get("started_at"),
+                "finished_at": datetime.utcnow().isoformat(),
+                "data": data,
+            }
         )
         logging.info("[job:%s] Done — matched %d/%d", job_id, len(result_rows), len(symbols))
     except Exception as exc:
         logging.exception("[job:%s] Scan failed: %s", job_id, exc)
-        _update_job(
-            job_id,
-            status="error",
-            finished_at=datetime.utcnow().isoformat(),
-            error=str(exc),
+        _update_job(job_id, status="error", finished_at=datetime.utcnow().isoformat(), error=str(exc))
+        job_snapshot = _get_job(job_id) or {}
+        _store_prepend_record(
+            {
+                "job_id": job_id,
+                "status": "error",
+                "created_at": job_snapshot.get("created_at"),
+                "started_at": job_snapshot.get("started_at"),
+                "finished_at": datetime.utcnow().isoformat(),
+                "error": str(exc),
+                "batch": job_snapshot.get("batch"),
+                "limit": job_snapshot.get("limit"),
+                "offset": job_snapshot.get("offset"),
+            }
         )
 
 
@@ -253,9 +335,102 @@ def scan_start() -> Any:
     )
 
 
+# ---------------------------------------------------------------------------
+# Simple UI (server-rendered HTML)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/")
+@app.get("/ui")
+def ui_home() -> Any:
+    as_of = request.args.get("as_of", "").strip()
+    b = request.args.get("b", "").strip() or "1"
+    job_id = request.args.get("job_id", "").strip()
+
+    job: dict[str, Any] | None = None
+    if job_id:
+        job = _read_record_from_store(job_id) or _get_job(job_id)
+
+    return render_template("ui.html", as_of=as_of, b=b, job_id=job_id, job=job)
+
+
+@app.get("/ui/start")
+def ui_start() -> Any:
+    # Start scan with GET-friendly args (as_of, b)
+    args_payload: dict[str, Any] = {}
+    if request.args.get("as_of"):
+        args_payload["as_of"] = request.args.get("as_of")
+    if request.args.get("b"):
+        args_payload["b"] = request.args.get("b")
+
+    # Reuse the same logic as API start (but avoid calling the route function directly)
+    try:
+        config = _build_config({})
+        symbols = _resolve_symbols_from_payload(args_payload)
+        as_of = _as_of_from_payload(args_payload)
+        batch, limit, offset = _batch_params(args_payload)
+    except ValueError as exc:
+        return render_template("ui.html", as_of=args_payload.get("as_of", ""), b=args_payload.get("b", "1"), job=None, job_id="", error=str(exc)), 400
+
+    job_id = _new_job()
+    _update_job(job_id, batch=batch, limit=limit, offset=offset, total_in_chunk=len(symbols))
+    t = threading.Thread(target=_run_scan_job, args=(job_id, symbols, config, as_of), daemon=True)
+    t.start()
+
+    return redirect(url_for("ui_job", job_id=job_id))
+
+
+@app.get("/ui/job/<job_id>")
+def ui_job(job_id: str) -> Any:
+    job = _read_record_from_store(job_id) or _get_job(job_id)
+    if not job:
+        return render_template("ui_job.html", job_id=job_id, status="not_found", data=None), 404
+
+    # Normalize shape to match the stored record format when reading from memory
+    status = job.get("status", "pending")
+    if "data" in job:
+        data = job.get("data")
+    else:
+        data = job.get("data")
+
+    return render_template("ui_job.html", job_id=job_id, status=status, job=job, data=data)
+
+
 @app.get("/api/v1/scan/<job_id>")
 def scan_status(job_id: str) -> Any:
     """Poll the result of an async scan job."""
+    # First check persistent store (survives restarts)
+    stored = _read_record_from_store(job_id)
+    if stored:
+        status = stored.get("status")
+        if status == "done":
+            return (
+                jsonify(
+                    {
+                        "success": True,
+                        "status": "done",
+                        "message": "Scan completed.",
+                        "job_id": str(stored.get("job_id")),
+                        "data": stored.get("data"),
+                    }
+                ),
+                200,
+            )
+        if status == "error":
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "status": "error",
+                        "message": "Scan failed.",
+                        "job_id": str(stored.get("job_id")),
+                        "error": stored.get("error"),
+                    }
+                ),
+                500,
+            )
+        return jsonify({"success": True, "status": status, "job_id": str(stored.get("job_id"))}), 202
+
     job = _get_job(job_id)
     if not job:
         return jsonify({"success": False, "message": "Job not found."}), 404
