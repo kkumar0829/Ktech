@@ -496,6 +496,35 @@ def health() -> Any:
     return jsonify({"success": True, "message": "Service is healthy"}), 200
 
 
+@app.get("/api/v1/diag")
+def diag() -> Any:
+    """Basic diagnostics for Render/Supabase configuration (no secrets)."""
+    info: dict[str, Any] = {
+        "supabase_url_set": bool(_SUPABASE_URL),
+        "supabase_enabled": _sb_enabled(),
+        "supabase_url": _SUPABASE_URL,
+        "supabase_key_prefix": (_SUPABASE_KEY[:12] + "...") if _SUPABASE_KEY else None,
+        "max_stored_jobs": _MAX_STORED_JOBS,
+    }
+    if _sb_enabled():
+        try:
+            r = requests.get(
+                _sb_table_url(),
+                headers=_sb_headers(),
+                params={"select": "job_id,status,created_at", "order": "job_id.desc", "limit": "1"},
+                timeout=20,
+            )
+            info["supabase_http_status"] = r.status_code
+            # keep response tiny
+            try:
+                info["supabase_response"] = r.json()
+            except Exception:
+                info["supabase_response"] = (r.text or "")[:200]
+        except Exception as exc:
+            info["supabase_error"] = str(exc)
+    return jsonify(info), 200
+
+
 @app.get("/api/v1/scan")
 @app.post("/api/v1/scan")
 def scan_start() -> Any:
@@ -615,6 +644,14 @@ def ui_job_picker() -> Any:
 @app.get("/ui/<job_id>")
 @app.get("/ui/job/<job_id>")
 def ui_job(job_id: str) -> Any:
+    if _sb_enabled():
+        row = _sb_get_job(job_id)
+        if row:
+            status = row.get("status", "pending")
+            data = row.get("result")
+            job = row
+            return render_template("ui_job.html", job_id=str(row.get("job_id")), status=status, job=job, data=data)
+
     job = _read_record_from_store(job_id) or _get_job(job_id)
     if not job:
         return render_template("ui_job.html", job_id=job_id, status="not_found", data=None), 404
