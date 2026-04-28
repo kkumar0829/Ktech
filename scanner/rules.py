@@ -8,8 +8,10 @@ one-file-per-rule over time.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, List, Literal, Sequence
 
 import pandas as pd
@@ -418,54 +420,81 @@ def scan_symbols(symbols: Iterable[str], config: ScannerConfig, *, as_of: date |
     if as_of is not None:
         as_of_end = datetime(as_of.year, as_of.month, as_of.day) + timedelta(days=1)
 
-    for idx, symbol in enumerate(symbol_list, start=1):
-        clean_symbol = symbol.strip().upper()
-        if not clean_symbol:
-            continue
-        logger.info("Scanning %d/%d: %s", idx, total, clean_symbol)
+    clean_symbols: list[str] = []
+    for s in symbol_list:
+        cs = s.strip().upper()
+        if cs:
+            clean_symbols.append(cs)
+
+    def _scan_one(clean_symbol: str) -> ScanResult | None:
+        # Fetch daily OHLCV
+        if as_of is None:
+            raw_df = fetch_ohlcv(clean_symbol, config.lookback_days)
+        else:
+            raw_df = fetch_ohlcv_asof(clean_symbol, config.lookback_days, as_of, interval="1d")
+        if raw_df.empty:
+            return None
+
+        enriched_df = add_indicators(
+            raw_df,
+            ma_window=config.ma_window,
+            ma50_window=config.ma50_window,
+            breakout_window=config.breakout_window,
+            rsi_window=config.rsi_window,
+        )
+        result = evaluate_symbol(clean_symbol, enriched_df, config)
+        if not result:
+            return None
+
+        # AVWAP swing signal — informational, not used as a filter
         try:
-            if as_of is None:
-                raw_df = fetch_ohlcv(clean_symbol, config.lookback_days)
-            else:
-                raw_df = fetch_ohlcv_asof(clean_symbol, config.lookback_days, as_of, interval="1d")
-            if raw_df.empty:
-                continue
-            enriched_df = add_indicators(
-                raw_df,
-                ma_window=config.ma_window,
-                ma50_window=config.ma50_window,
-                breakout_window=config.breakout_window,
-                rsi_window=config.rsi_window,
-            )
-            result = evaluate_symbol(clean_symbol, enriched_df, config)
-            if not result:
-                continue
-
-            # AVWAP swing signal — informational, not used as a filter
-            try:
-                result.avwap_signal = compute_avwap_signal(raw_df)
-            except Exception as exc:
-                logger.warning("Failed to compute AVWAP signal for %s: %s", clean_symbol, exc)
-
-            try:
-                if as_of_end is None:
-                    df_1h = fetch_ohlcv_interval(clean_symbol, period="30d", interval="60m")
-                    df_15m = fetch_ohlcv_interval(clean_symbol, period="10d", interval="15m")
-                else:
-                    df_1h = fetch_ohlcv_range(
-                        clean_symbol, start=as_of_end - timedelta(days=30), end=as_of_end, interval="60m"
-                    )
-                    df_15m = fetch_ohlcv_range(
-                        clean_symbol, start=as_of_end - timedelta(days=10), end=as_of_end, interval="15m"
-                    )
-                result.bias_1h = bias_from_ohlc_df(df_1h, timeframe="1H")
-                result.bias_15m = bias_from_ohlc_df(df_15m, timeframe="15M")
-            except Exception as exc:
-                logger.warning("Failed to compute SMC bias for %s: %s", clean_symbol, exc)
-
-            results.append(result)
+            result.avwap_signal = compute_avwap_signal(raw_df)
         except Exception as exc:
-            logger.exception("Unhandled error while scanning %s: %s", clean_symbol, exc)
+            logger.warning("Failed to compute AVWAP signal for %s: %s", clean_symbol, exc)
+
+        # Intraday bias only for matched symbols (still can be expensive but count is small)
+        try:
+            if as_of_end is None:
+                df_1h = fetch_ohlcv_interval(clean_symbol, period="30d", interval="60m")
+                df_15m = fetch_ohlcv_interval(clean_symbol, period="10d", interval="15m")
+            else:
+                df_1h = fetch_ohlcv_range(clean_symbol, start=as_of_end - timedelta(days=30), end=as_of_end, interval="60m")
+                df_15m = fetch_ohlcv_range(clean_symbol, start=as_of_end - timedelta(days=10), end=as_of_end, interval="15m")
+            result.bias_1h = bias_from_ohlc_df(df_1h, timeframe="1H")
+            result.bias_15m = bias_from_ohlc_df(df_15m, timeframe="15M")
+        except Exception as exc:
+            logger.warning("Failed to compute SMC bias for %s: %s", clean_symbol, exc)
+
+        return result
+
+    # Parallelize daily fetches to cut wall-clock time.
+    # Keep worker count conservative to reduce Yahoo throttling.
+    max_workers = min(12, max(4, (os.cpu_count() or 4)))
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            future_map = {ex.submit(_scan_one, cs): cs for cs in clean_symbols}
+            done_count = 0
+            for fut in as_completed(future_map):
+                cs = future_map[fut]
+                done_count += 1
+                if done_count % 50 == 0 or done_count == total:
+                    logger.info("Scanned %d/%d", done_count, total)
+                try:
+                    r = fut.result()
+                    if r:
+                        results.append(r)
+                except Exception as exc:
+                    logger.exception("Unhandled error while scanning %s: %s", cs, exc)
+    except Exception:
+        # Fallback to sequential in case the executor fails in some envs
+        for idx, cs in enumerate(clean_symbols, start=1):
+            logger.info("Scanning %d/%d: %s", idx, total, cs)
+            try:
+                r = _scan_one(cs)
+                if r:
+                    results.append(r)
+            except Exception as exc:
+                logger.exception("Unhandled error while scanning %s: %s", cs, exc)
 
     return rank_results(results)
 

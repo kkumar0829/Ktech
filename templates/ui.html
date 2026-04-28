@@ -53,8 +53,8 @@
             <label>open past job</label>
             <select name="job_id">
               <option value="">Select job id…</option>
-              {% for jid in (recent_job_ids or []) %}
-                <option value="{{ jid }}">{{ jid }}</option>
+              {% for j in (recent_jobs or []) %}
+                <option value="{{ j.id }}">{{ j.label }}</option>
               {% endfor %}
             </select>
           </div>

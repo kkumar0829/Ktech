@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from flask import Flask, jsonify, request, render_template, redirect, url_for
+import requests
 
 from scanner.config import ScannerConfig
 from scanner.logger import setup_logging
@@ -31,6 +32,81 @@ _job_counter = 0
 _STATE_DIR = Path(os.getenv("STATE_DIR", Path(__file__).parent))
 _COUNTER_FILE = _STATE_DIR / "job_counter.txt"
 _RESULTS_STORE_FILE = _STATE_DIR / "scan_results_store.jsonl"  # newest-first JSONL, keep last 50
+_MAX_STORED_JOBS = int(os.getenv("MAX_STORED_JOBS", "200"))
+
+# Supabase persistence (free-tier friendly if you use an external DB)
+_SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+_SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip() or os.getenv("SUPABASE_KEY", "").strip()
+
+
+def _sb_enabled() -> bool:
+    return bool(_SUPABASE_URL and _SUPABASE_KEY)
+
+
+def _sb_headers() -> dict[str, str]:
+    return {
+        "apikey": _SUPABASE_KEY,
+        "Authorization": f"Bearer {_SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def _sb_table_url() -> str:
+    return f"{_SUPABASE_URL.rstrip('/')}/rest/v1/scan_jobs"
+
+
+def _sb_create_job(*, batch: int, as_of: str | None) -> str:
+    """Insert a job row and return numeric job_id as string."""
+    payload: dict[str, Any] = {"status": "pending", "batch": batch}
+    if as_of:
+        payload["as_of"] = as_of
+    r = requests.post(
+        _sb_table_url(),
+        headers={**_sb_headers(), "Prefer": "return=representation"},
+        data=json.dumps(payload),
+        timeout=20,
+    )
+    r.raise_for_status()
+    data = r.json()
+    # PostgREST returns list of rows
+    job_id = data[0]["job_id"]
+    return str(job_id)
+
+
+def _sb_update_job(job_id: str, patch: dict[str, Any]) -> None:
+    r = requests.patch(
+        _sb_table_url(),
+        headers=_sb_headers(),
+        params={"job_id": f"eq.{job_id}"},
+        data=json.dumps(patch),
+        timeout=20,
+    )
+    r.raise_for_status()
+
+
+def _sb_get_job(job_id: str) -> dict[str, Any] | None:
+    r = requests.get(
+        _sb_table_url(),
+        headers=_sb_headers(),
+        params={"job_id": f"eq.{job_id}", "select": "*"},
+        timeout=20,
+    )
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    rows = r.json()
+    return rows[0] if rows else None
+
+
+def _sb_list_jobs(limit: int = 50) -> list[dict[str, Any]]:
+    r = requests.get(
+        _sb_table_url(),
+        headers=_sb_headers(),
+        params={"select": "job_id,batch,created_at,finished_at,status", "order": "job_id.desc", "limit": str(limit)},
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.json() or []
 
 
 def _ensure_state_dir() -> None:
@@ -57,9 +133,10 @@ def _persist_counter_to_file(value: int) -> None:
     tmp.replace(_COUNTER_FILE)
 
 
-def _store_prepend_record(record: dict[str, Any], *, keep: int = 50) -> None:
+def _store_prepend_record(record: dict[str, Any], *, keep: int | None = None) -> None:
     """Store newest-first JSONL, keep only N records (LIFO)."""
     _ensure_state_dir()
+    keep_n = int(keep) if keep is not None else _MAX_STORED_JOBS
     line = json.dumps(record, ensure_ascii=False)
     existing: list[str] = []
     if _RESULTS_STORE_FILE.exists():
@@ -67,7 +144,7 @@ def _store_prepend_record(record: dict[str, Any], *, keep: int = 50) -> None:
             existing = [ln for ln in _RESULTS_STORE_FILE.read_text(encoding="utf-8").splitlines() if ln.strip()]
         except Exception:
             existing = []
-    new_lines = [line] + existing[: max(0, keep - 1)]
+    new_lines = [line] + existing[: max(0, keep_n - 1)]
     tmp = _RESULTS_STORE_FILE.with_suffix(".tmp")
     tmp.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
     tmp.replace(_RESULTS_STORE_FILE)
@@ -90,12 +167,42 @@ def _read_record_from_store(job_id: str) -> dict[str, Any] | None:
     return None
 
 
-def _list_job_ids_from_store(*, limit: int = 50) -> list[str]:
-    """Return newest-first job_ids from the store file."""
+def _format_job_label(job_id: str, batch: str | None, ts_iso: str | None) -> str:
+    """Format exactly: 4 (2 - 24-04 2:07 pm)."""
+    if not ts_iso:
+        return f"{job_id} ({batch})" if batch else str(job_id)
+    try:
+        dt = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+        # dd-mm h:mm am/pm
+        label = dt.strftime("%d-%m %I:%M %p").lower()
+        # strip leading zero from hour (e.g. 02:07 -> 2:07)
+        label = label.replace(" 0", " ")
+        b = str(batch) if batch else "?"
+        return f"{job_id} ({b} - {label})"
+    except Exception:
+        return str(job_id)
+
+
+def _list_jobs_from_store(*, limit: int | None = None) -> list[dict[str, str]]:
+    """Return newest-first jobs from the store file for UI dropdown."""
+    if _sb_enabled():
+        out: list[dict[str, str]] = []
+        try:
+            rows = _sb_list_jobs(limit=int(limit) if limit is not None else _MAX_STORED_JOBS)
+            for row in rows:
+                jid_s = str(row.get("job_id"))
+                batch = str(row.get("batch")) if row.get("batch") is not None else None
+                ts = row.get("finished_at") or row.get("created_at")
+                out.append({"id": jid_s, "label": _format_job_label(jid_s, batch, ts)})
+        except Exception:
+            return out
+        return out
+
     if not _RESULTS_STORE_FILE.exists():
         return []
-    out: list[str] = []
+    out: list[dict[str, str]] = []
     try:
+        lim = int(limit) if limit is not None else _MAX_STORED_JOBS
         for ln in _RESULTS_STORE_FILE.read_text(encoding="utf-8").splitlines():
             ln = ln.strip()
             if not ln:
@@ -104,8 +211,19 @@ def _list_job_ids_from_store(*, limit: int = 50) -> list[str]:
             jid = obj.get("job_id")
             if jid is None:
                 continue
-            out.append(str(jid))
-            if len(out) >= limit:
+            jid_s = str(jid)
+            ts = obj.get("finished_at") or obj.get("created_at")
+            batch = None
+            try:
+                # stored records put batch under data.batch (done) or batch (error)
+                if isinstance(obj.get("data"), dict) and obj["data"].get("batch") is not None:
+                    batch = str(obj["data"].get("batch"))
+                elif obj.get("batch") is not None:
+                    batch = str(obj.get("batch"))
+            except Exception:
+                batch = None
+            out.append({"id": jid_s, "label": _format_job_label(jid_s, batch, ts)})
+            if len(out) >= lim:
                 break
     except Exception:
         return out
@@ -114,6 +232,11 @@ def _list_job_ids_from_store(*, limit: int = 50) -> list[str]:
 
 def _new_job() -> str:
     global _job_counter
+    if _sb_enabled():
+        # Supabase identity column gives us short numeric ids; no local counter needed.
+        # as_of/batch are attached later in scan_start/ui_start.
+        raise RuntimeError("Use _create_job_with_batch() when Supabase is enabled")
+
     with _jobs_lock:
         if _job_counter <= 0:
             _job_counter = _load_counter_from_file()
@@ -122,6 +245,13 @@ def _new_job() -> str:
         _persist_counter_to_file(_job_counter)
         _jobs[job_id] = {"status": "pending", "created_at": datetime.utcnow().isoformat()}
     return job_id
+
+
+def _create_job_with_batch(*, batch: int, as_of: str | None) -> str:
+    if _sb_enabled():
+        return _sb_create_job(batch=batch, as_of=as_of)
+    # fallback to local counter
+    return _new_job()
 
 
 def _update_job(job_id: str, **kwargs: Any) -> None:
@@ -258,6 +388,11 @@ def _as_of_from_payload(payload: dict[str, Any]) -> date | None:
 
 def _run_scan_job(job_id: str, symbols: list[str], config: ScannerConfig, as_of: date | None) -> None:
     _update_job(job_id, status="running", started_at=datetime.utcnow().isoformat())
+    if _sb_enabled():
+        try:
+            _sb_update_job(job_id, {"status": "running", "started_at": datetime.utcnow().isoformat()})
+        except Exception as exc:
+            logging.warning("[job:%s] Supabase update failed (running): %s", job_id, exc)
     try:
         job_snapshot = _get_job(job_id) or {}
         logging.info("[job:%s] Scanning %d symbols", job_id, len(symbols))
@@ -281,34 +416,72 @@ def _run_scan_job(job_id: str, symbols: list[str], config: ScannerConfig, as_of:
         }
         _update_job(job_id, status="done", finished_at=datetime.utcnow().isoformat(), data=data)
 
-        _store_prepend_record(
-            {
-                "job_id": job_id,
-                "status": "done",
-                "created_at": job_snapshot.get("created_at"),
-                "started_at": job_snapshot.get("started_at"),
-                "finished_at": datetime.utcnow().isoformat(),
-                "data": data,
-            }
-        )
+        if _sb_enabled():
+            try:
+                _sb_update_job(
+                    job_id,
+                    {
+                        "status": "done",
+                        "finished_at": datetime.utcnow().isoformat(),
+                        "result": data,
+                        "error": None,
+                    },
+                )
+                # keep last N in DB
+                # (do best-effort cleanup; not critical if it fails)
+                rows = _sb_list_jobs(limit=5000)
+                if len(rows) > _MAX_STORED_JOBS:
+                    cutoff = sorted([int(r["job_id"]) for r in rows], reverse=True)[_MAX_STORED_JOBS - 1]
+                    requests.delete(
+                        _sb_table_url(),
+                        headers=_sb_headers(),
+                        params={"job_id": f"lt.{cutoff}"},
+                        timeout=20,
+                    )
+            except Exception as exc:
+                logging.warning("[job:%s] Supabase update failed (done): %s", job_id, exc)
+        else:
+            _store_prepend_record(
+                {
+                    "job_id": job_id,
+                    "status": "done",
+                    "created_at": job_snapshot.get("created_at"),
+                    "started_at": job_snapshot.get("started_at"),
+                    "finished_at": datetime.utcnow().isoformat(),
+                    "data": data,
+                }
+            )
         logging.info("[job:%s] Done — matched %d/%d", job_id, len(result_rows), len(symbols))
     except Exception as exc:
         logging.exception("[job:%s] Scan failed: %s", job_id, exc)
         _update_job(job_id, status="error", finished_at=datetime.utcnow().isoformat(), error=str(exc))
         job_snapshot = _get_job(job_id) or {}
-        _store_prepend_record(
-            {
-                "job_id": job_id,
-                "status": "error",
-                "created_at": job_snapshot.get("created_at"),
-                "started_at": job_snapshot.get("started_at"),
-                "finished_at": datetime.utcnow().isoformat(),
-                "error": str(exc),
-                "batch": job_snapshot.get("batch"),
-                "limit": job_snapshot.get("limit"),
-                "offset": job_snapshot.get("offset"),
-            }
-        )
+        if _sb_enabled():
+            try:
+                _sb_update_job(
+                    job_id,
+                    {
+                        "status": "error",
+                        "finished_at": datetime.utcnow().isoformat(),
+                        "error": str(exc),
+                    },
+                )
+            except Exception as sb_exc:
+                logging.warning("[job:%s] Supabase update failed (error): %s", job_id, sb_exc)
+        else:
+            _store_prepend_record(
+                {
+                    "job_id": job_id,
+                    "status": "error",
+                    "created_at": job_snapshot.get("created_at"),
+                    "started_at": job_snapshot.get("started_at"),
+                    "finished_at": datetime.utcnow().isoformat(),
+                    "error": str(exc),
+                    "batch": job_snapshot.get("batch"),
+                    "limit": job_snapshot.get("limit"),
+                    "offset": job_snapshot.get("offset"),
+                }
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +509,7 @@ def scan_start() -> Any:
     except ValueError as exc:
         return jsonify({"success": False, "message": "Invalid request payload.", "error": str(exc)}), 400
 
-    job_id = _new_job()
+    job_id = _create_job_with_batch(batch=batch, as_of=as_of.isoformat() if as_of else None)
     _update_job(job_id, batch=batch, limit=limit, offset=offset, total_in_chunk=len(symbols))
     t = threading.Thread(target=_run_scan_job, args=(job_id, symbols, config, as_of), daemon=True)
     t.start()
@@ -373,14 +546,15 @@ def ui_home() -> Any:
     if job_id:
         job = _read_record_from_store(job_id) or _get_job(job_id)
 
-    recent_job_ids = _list_job_ids_from_store(limit=50)
+    # UI dropdown: show up to the stored limit (default 200)
+    recent_jobs = _list_jobs_from_store(limit=_MAX_STORED_JOBS)
     return render_template(
         "ui.html",
         as_of=as_of,
         b=b,
         job_id=job_id,
         job=job,
-        recent_job_ids=recent_job_ids,
+        recent_jobs=recent_jobs,
     )
 
 
@@ -402,7 +576,7 @@ def ui_start() -> Any:
     except ValueError as exc:
         return render_template("ui.html", as_of=args_payload.get("as_of", ""), b=args_payload.get("b", "1"), job=None, job_id="", error=str(exc)), 400
 
-    job_id = _new_job()
+    job_id = _create_job_with_batch(batch=batch, as_of=as_of.isoformat() if as_of else None)
     _update_job(job_id, batch=batch, limit=limit, offset=offset, total_in_chunk=len(symbols))
     t = threading.Thread(target=_run_scan_job, args=(job_id, symbols, config, as_of), daemon=True)
     t.start()
@@ -438,6 +612,39 @@ def ui_job(job_id: str) -> Any:
 @app.get("/api/v1/scan/<job_id>")
 def scan_status(job_id: str) -> Any:
     """Poll the result of an async scan job."""
+    if _sb_enabled():
+        row = _sb_get_job(job_id)
+        if not row:
+            return jsonify({"success": False, "message": "Job not found."}), 404
+        status = row.get("status")
+        if status == "done":
+            return (
+                jsonify(
+                    {
+                        "success": True,
+                        "status": "done",
+                        "message": "Scan completed.",
+                        "job_id": str(row.get("job_id")),
+                        "data": row.get("result"),
+                    }
+                ),
+                200,
+            )
+        if status == "error":
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "status": "error",
+                        "message": "Scan failed.",
+                        "job_id": str(row.get("job_id")),
+                        "error": row.get("error"),
+                    }
+                ),
+                500,
+            )
+        return jsonify({"success": True, "status": status, "job_id": str(row.get("job_id"))}), 202
+
     # First check persistent store (survives restarts)
     stored = _read_record_from_store(job_id)
     if stored:

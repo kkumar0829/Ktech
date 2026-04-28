@@ -4,9 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Scan Job {{ job_id }}</title>
-    {% if status in ["pending", "running"] %}
-      <meta http-equiv="refresh" content="30" />
-    {% endif %}
+    {# no auto-refresh #}
     <style>
       body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
       .top { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
@@ -21,6 +19,11 @@
       th { position: sticky; top: 0; background: white; }
       .wrap { max-width: 1200px; }
       code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; }
+      .sig-green { color: #166534; font-weight: 600; }
+      .sig-red { color: #991b1b; font-weight: 600; }
+      .sig-grey { color: #6b7280; font-weight: 600; }
+      tr.row-green td { background: #ecfdf5; }
+      tr.row-red td { background: #fef2f2; }
     </style>
   </head>
   <body>
@@ -37,9 +40,7 @@
         {% else %}
           <span class="pill">{{ status }}</span>
         {% endif %}
-        {% if status in ["pending", "running"] %}
-          <div class="muted">Auto-refreshing every 5s…</div>
-        {% endif %}
+        {# no auto-refresh hint #}
       </div>
 
       {% if status == "not_found" %}
@@ -73,15 +74,23 @@
           </thead>
           <tbody>
             {% for r in data.get("results") %}
-              <tr>
+              {% set b1 = (r.get("bias_1h") or "")|upper %}
+              {% set b15 = (r.get("bias_15m") or "")|upper %}
+              {% set av = (r.get("avwap_signal") or "")|upper %}
+              {% set c1 = "sig-green" if b1 == "BULLISH" else ("sig-red" if b1 == "BEARISH" else "sig-grey") %}
+              {% set c2 = "sig-green" if b15 == "BULLISH" else ("sig-red" if b15 == "BEARISH" else "sig-grey") %}
+              {% set c3 = "sig-green" if av == "BUY" else ("sig-red" if av == "SELL" else "sig-grey") %}
+              {% set all_green = (c1 == "sig-green" and c2 == "sig-green" and c3 == "sig-green") %}
+              {% set all_red = (c1 == "sig-red" and c2 == "sig-red" and c3 == "sig-red") %}
+              <tr class="{{ 'row-green' if all_green else ('row-red' if all_red else '') }}">
                 <td>{{ r.get("symbol") }}</td>
                 <td>{{ r.get("close") }}</td>
                 <td>{{ r.get("volume_breakout") }}</td>
                 <td>{{ r.get("rsi") }}</td>
                 <td>{{ r.get("avg_turnover20_cr") }}</td>
-                <td>{{ r.get("bias_1h") }}</td>
-                <td>{{ r.get("bias_15m") }}</td>
-                <td>{{ r.get("avwap_signal") }}</td>
+                <td class="{{ c1 }}">{{ r.get("bias_1h") }}</td>
+                <td class="{{ c2 }}">{{ r.get("bias_15m") }}</td>
+                <td class="{{ c3 }}">{{ r.get("avwap_signal") }}</td>
               </tr>
             {% endfor %}
           </tbody>
