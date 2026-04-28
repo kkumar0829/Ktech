@@ -104,7 +104,12 @@ def _sb_list_jobs(limit: int = 50) -> list[dict[str, Any]]:
     r = requests.get(
         _sb_table_url(),
         headers=_sb_headers(),
-        params={"select": "job_id,batch,created_at,finished_at,status", "order": "job_id.desc", "limit": str(limit)},
+        params={
+            "select": "job_id,batch,created_at,finished_at,status",
+            "status": "eq.done",
+            "order": "job_id.desc",
+            "limit": str(limit),
+        },
         timeout=20,
     )
     r.raise_for_status()
@@ -210,6 +215,8 @@ def _list_jobs_from_store(*, limit: int | None = None) -> list[dict[str, str]]:
             if not ln:
                 continue
             obj = json.loads(ln)
+            if str(obj.get("status", "")).lower() != "done":
+                continue
             jid = obj.get("job_id")
             if jid is None:
                 continue
@@ -539,6 +546,9 @@ def scan_start() -> Any:
         batch, limit, offset = _batch_params(payload)
     except ValueError as exc:
         return jsonify({"success": False, "message": "Invalid request payload.", "error": str(exc)}), 400
+    except Exception as exc:
+        logging.exception("Failed to parse scan request: %s", exc)
+        return jsonify({"success": False, "message": "Failed to parse scan request.", "error": str(exc)}), 500
 
     try:
         job_id = _create_job_with_batch(batch=batch, as_of=as_of.isoformat() if as_of else None)
@@ -546,8 +556,13 @@ def scan_start() -> Any:
         logging.exception("Failed to create job id (Supabase/local): %s", exc)
         return jsonify({"success": False, "message": "Failed to start scan.", "error": str(exc)}), 500
     _update_job(job_id, batch=batch, limit=limit, offset=offset, total_in_chunk=len(symbols))
-    t = threading.Thread(target=_run_scan_job, args=(job_id, symbols, config, as_of), daemon=True)
-    t.start()
+    try:
+        t = threading.Thread(target=_run_scan_job, args=(job_id, symbols, config, as_of), daemon=True)
+        t.start()
+    except Exception as exc:
+        # If the job row was already created in Supabase, do not fail the request with a 500.
+        # Client can still poll the job_id; the status will remain pending/error.
+        logging.exception("Failed to start background scan thread for job %s: %s", job_id, exc)
 
     return (
         jsonify(
@@ -609,7 +624,20 @@ def ui_start() -> Any:
         as_of = _as_of_from_payload(args_payload)
         batch, limit, offset = _batch_params(args_payload)
     except ValueError as exc:
-        return render_template("ui.html", as_of=args_payload.get("as_of", ""), b=args_payload.get("b", "1"), job=None, job_id="", error=str(exc)), 400
+        return render_template("ui.html", as_of=args_payload.get("as_of", ""), b=args_payload.get("b", "1"), job=None, job_id="", recent_jobs=_list_jobs_from_store(limit=_MAX_STORED_JOBS), error=str(exc)), 400
+    except Exception as exc:
+        return (
+            render_template(
+                "ui.html",
+                as_of=args_payload.get("as_of", ""),
+                b=args_payload.get("b", "1"),
+                job=None,
+                job_id="",
+                recent_jobs=_list_jobs_from_store(limit=_MAX_STORED_JOBS),
+                error=f"Failed to start scan: {exc}",
+            ),
+            500,
+        )
 
     try:
         job_id = _create_job_with_batch(batch=batch, as_of=as_of.isoformat() if as_of else None)
@@ -627,8 +655,12 @@ def ui_start() -> Any:
             500,
         )
     _update_job(job_id, batch=batch, limit=limit, offset=offset, total_in_chunk=len(symbols))
-    t = threading.Thread(target=_run_scan_job, args=(job_id, symbols, config, as_of), daemon=True)
-    t.start()
+    try:
+        t = threading.Thread(target=_run_scan_job, args=(job_id, symbols, config, as_of), daemon=True)
+        t.start()
+    except Exception as exc:
+        # Still redirect to the job page (job_id exists); user can see status/poll later.
+        logging.exception("Failed to start background scan thread for job %s: %s", job_id, exc)
 
     return redirect(url_for("ui_job", job_id=job_id))
 
