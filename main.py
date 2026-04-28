@@ -36,7 +36,9 @@ _MAX_STORED_JOBS = int(os.getenv("MAX_STORED_JOBS", "200"))
 
 # Supabase persistence (free-tier friendly if you use an external DB)
 _SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
-_SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip() or os.getenv("SUPABASE_KEY", "").strip()
+# Only enable Supabase when the server has the service_role key.
+# Avoid accidentally enabling with a publishable/anon key (would fail with RLS and cause 500s).
+_SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
 
 def _sb_enabled() -> bool:
@@ -509,7 +511,11 @@ def scan_start() -> Any:
     except ValueError as exc:
         return jsonify({"success": False, "message": "Invalid request payload.", "error": str(exc)}), 400
 
-    job_id = _create_job_with_batch(batch=batch, as_of=as_of.isoformat() if as_of else None)
+    try:
+        job_id = _create_job_with_batch(batch=batch, as_of=as_of.isoformat() if as_of else None)
+    except Exception as exc:
+        logging.exception("Failed to create job id (Supabase/local): %s", exc)
+        return jsonify({"success": False, "message": "Failed to start scan.", "error": str(exc)}), 500
     _update_job(job_id, batch=batch, limit=limit, offset=offset, total_in_chunk=len(symbols))
     t = threading.Thread(target=_run_scan_job, args=(job_id, symbols, config, as_of), daemon=True)
     t.start()
@@ -576,7 +582,21 @@ def ui_start() -> Any:
     except ValueError as exc:
         return render_template("ui.html", as_of=args_payload.get("as_of", ""), b=args_payload.get("b", "1"), job=None, job_id="", error=str(exc)), 400
 
-    job_id = _create_job_with_batch(batch=batch, as_of=as_of.isoformat() if as_of else None)
+    try:
+        job_id = _create_job_with_batch(batch=batch, as_of=as_of.isoformat() if as_of else None)
+    except Exception as exc:
+        return (
+            render_template(
+                "ui.html",
+                as_of=args_payload.get("as_of", ""),
+                b=args_payload.get("b", "1"),
+                job=None,
+                job_id="",
+                recent_jobs=_list_jobs_from_store(limit=_MAX_STORED_JOBS),
+                error=f"Failed to start scan (persistence not configured): {exc}",
+            ),
+            500,
+        )
     _update_job(job_id, batch=batch, limit=limit, offset=offset, total_in_chunk=len(symbols))
     t = threading.Thread(target=_run_scan_job, args=(job_id, symbols, config, as_of), daemon=True)
     t.start()
