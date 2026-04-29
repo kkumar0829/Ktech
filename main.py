@@ -59,6 +59,7 @@ def _sb_table_url() -> str:
 
 def _sb_create_job(*, batch: int, as_of: str | None) -> str:
     """Insert a job row and return numeric job_id as string."""
+    # Create as pending; worker flips to running/done.
     payload: dict[str, Any] = {"status": "pending", "batch": batch}
     if as_of:
         payload["as_of"] = as_of
@@ -532,6 +533,36 @@ def diag() -> Any:
     return jsonify(info), 200
 
 
+@app.get("/api/v1/diag/supabase-write")
+def diag_supabase_write() -> Any:
+    """Verify Supabase insert+update+select works (no secrets)."""
+    if not _sb_enabled():
+        return jsonify({"ok": False, "error": "SUPABASE_NOT_ENABLED"}), 400
+    out: dict[str, Any] = {"ok": False}
+    try:
+        # 1) insert
+        job_id = _sb_create_job(batch=9, as_of=None)
+        out["insert_job_id"] = job_id
+
+        # 2) update
+        _sb_update_job(job_id, {"status": "running", "started_at": datetime.utcnow().isoformat()})
+        out["update_running_ok"] = True
+
+        # 3) select
+        row = _sb_get_job(job_id)
+        out["selected_status"] = row.get("status") if row else None
+
+        # 4) final update to done with tiny payload
+        _sb_update_job(job_id, {"status": "done", "finished_at": datetime.utcnow().isoformat(), "result": {"ping": "ok"}})
+        row2 = _sb_get_job(job_id)
+        out["selected_status_after_done"] = row2.get("status") if row2 else None
+        out["ok"] = True
+        return jsonify(out), 200
+    except Exception as exc:
+        out["error"] = str(exc)
+        return jsonify(out), 500
+
+
 @app.get("/api/v1/scan")
 @app.post("/api/v1/scan")
 def scan_start() -> Any:
@@ -556,6 +587,13 @@ def scan_start() -> Any:
         logging.exception("Failed to create job id (Supabase/local): %s", exc)
         return jsonify({"success": False, "message": "Failed to start scan.", "error": str(exc)}), 500
     _update_job(job_id, batch=batch, limit=limit, offset=offset, total_in_chunk=len(symbols))
+    if _sb_enabled():
+        # If this fails, it explains why jobs get stuck in pending.
+        try:
+            _sb_update_job(job_id, {"status": "running", "started_at": datetime.utcnow().isoformat()})
+        except Exception as exc:
+            logging.exception("Supabase UPDATE failed for job %s: %s", job_id, exc)
+            return jsonify({"success": False, "message": "Supabase update failed.", "job_id": job_id, "error": str(exc)}), 500
     try:
         t = threading.Thread(target=_run_scan_job, args=(job_id, symbols, config, as_of), daemon=True)
         t.start()
@@ -655,6 +693,22 @@ def ui_start() -> Any:
             500,
         )
     _update_job(job_id, batch=batch, limit=limit, offset=offset, total_in_chunk=len(symbols))
+    if _sb_enabled():
+        try:
+            _sb_update_job(job_id, {"status": "running", "started_at": datetime.utcnow().isoformat()})
+        except Exception as exc:
+            return (
+                render_template(
+                    "ui.html",
+                    as_of=args_payload.get("as_of", ""),
+                    b=args_payload.get("b", "1"),
+                    job=None,
+                    job_id="",
+                    recent_jobs=_list_jobs_from_store(limit=_MAX_STORED_JOBS),
+                    error=f"Supabase update failed (job created as {job_id}): {exc}",
+                ),
+                500,
+            )
     try:
         t = threading.Thread(target=_run_scan_job, args=(job_id, symbols, config, as_of), daemon=True)
         t.start()
