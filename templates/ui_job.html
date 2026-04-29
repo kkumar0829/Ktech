@@ -30,9 +30,7 @@
       .sig-red { color: #991b1b; font-weight: 600; }
       .sig-grey { color: #6b7280; font-weight: 600; }
       tr.row-green td { background: #86efac !important; } /* strong green */
-      tr.row-green-soft td { background: #dcfce7 !important; } /* light green */
       tr.row-red td { background: #fecaca !important; } /* strong red */
-      tr.row-red-soft td { background: #fee2e2 !important; } /* light red */
 
       /* Freeze first column (symbol) for horizontal scroll */
       th:first-child, td:first-child {
@@ -101,11 +99,9 @@
               {% set c1 = "sig-green" if b1 == "BULLISH" else ("sig-red" if b1 == "BEARISH" else "sig-grey") %}
               {% set c2 = "sig-green" if b15 == "BULLISH" else ("sig-red" if b15 == "BEARISH" else "sig-grey") %}
               {% set c3 = "sig-green" if av == "BUY" else ("sig-red" if av == "SELL" else "sig-grey") %}
-              {% set all_green = (c1 == "sig-green" and c2 == "sig-green" and c3 == "sig-green") %}
-              {% set all_red = (c1 == "sig-red" and c2 == "sig-red" and c3 == "sig-red") %}
-              {% set has_green = (c1 == "sig-green" or c2 == "sig-green" or c3 == "sig-green") %}
-              {% set has_red = (c1 == "sig-red" or c2 == "sig-red" or c3 == "sig-red") %}
-              {% set row_class = 'row-green' if all_green else ('row-red' if all_red else ('row-green-soft' if (has_green and not has_red) else ('row-red-soft' if (has_red and not has_green) else ''))) %}
+              {% set all_green = (b1 == "BULLISH" and b15 == "BULLISH" and av == "BUY") %}
+              {% set all_red = (b1 == "BEARISH" and b15 == "BEARISH" and av == "SELL") %}
+              {% set row_class = 'row-green' if all_green else ('row-red' if all_red else '') %}
               <tr class="{{ row_class }}">
                 <td>{{ r.get("symbol") }}</td>
                 <td class="{{ c1 }}">{{ r.get("bias_1h") }}</td>
