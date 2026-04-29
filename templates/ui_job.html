@@ -6,24 +6,31 @@
     <title>Scan Job {{ job_id }}</title>
     {# no auto-refresh #}
     <style>
-      body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
-      .top { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+      :root { color-scheme: light; }
+      body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; background: #f9fafb; }
+      .top { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
       a { text-decoration: none; color: #111827; }
       .pill { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 12px; }
       .ok { background: #dcfce7; color: #166534; }
       .run { background: #e0f2fe; color: #075985; }
       .err { background: #fee2e2; color: #991b1b; }
       .muted { color: #6b7280; font-size: 12px; }
-      table { border-collapse: collapse; width: 100%; margin-top: 14px; }
-      th, td { border-bottom: 1px solid #e5e7eb; padding: 8px 10px; font-size: 13px; text-align: left; }
-      th { position: sticky; top: 0; background: white; }
-      .wrap { max-width: 1200px; }
+      .wrap { max-width: 1320px; }
+      .card { background: white; border: 1px solid #e5e7eb; border-radius: 14px; padding: 14px; }
+      .meta { margin: 4px 0 10px; }
+      .table-wrap { overflow: auto; border: 1px solid #e5e7eb; border-radius: 12px; }
+      table { border-collapse: separate; border-spacing: 0; width: 100%; }
+      th, td { border-bottom: 1px solid #eef2f7; padding: 10px 12px; font-size: 13px; text-align: left; white-space: nowrap; }
+      th { position: sticky; top: 0; background: #f8fafc; border-bottom: 1px solid #e5e7eb; font-weight: 700; }
+      tbody tr:nth-child(even) td { background: #fcfcfd; }
+      tbody tr:hover td { background: #f1f5f9; }
+      td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
       code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; }
       .sig-green { color: #166534; font-weight: 600; }
       .sig-red { color: #991b1b; font-weight: 600; }
       .sig-grey { color: #6b7280; font-weight: 600; }
-      tr.row-green td { background: #ecfdf5; }
-      tr.row-red td { background: #fef2f2; }
+      tr.row-green td { background: #86efac !important; } /* strong green */
+      tr.row-red td { background: #fecaca !important; }
     </style>
   </head>
   <body>
@@ -52,27 +59,29 @@
       {% endif %}
 
       {% if data and data.get("results") %}
-        <div class="muted">
-          scanned: {{ data.get("scanned_symbols") }} |
-          matched: {{ data.get("matched_symbols") }} |
-          as_of: {{ data.get("as_of") }} |
-          batch: {{ data.get("batch") }} |
-          offset: {{ data.get("offset") }}
-        </div>
-        <table>
-          <thead>
-            <tr>
-              <th>symbol</th>
-              <th>close</th>
-              <th>volume_breakout</th>
-              <th>rsi</th>
-              <th>avg_turnover20_cr</th>
-              <th>bias_1h</th>
-              <th>bias_15m</th>
-              <th>avwap_signal</th>
-            </tr>
-          </thead>
-          <tbody>
+        <div class="card">
+          <div class="muted meta">
+            scanned: {{ data.get("scanned_symbols") }} |
+            matched: {{ data.get("matched_symbols") }} |
+            as_of: {{ data.get("as_of") }} |
+            batch: {{ data.get("batch") }} |
+            offset: {{ data.get("offset") }}
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>symbol</th>
+                  <th class="num">close</th>
+                  <th class="num">volume_breakout</th>
+                  <th class="num">rsi</th>
+                  <th class="num">avg_turnover20_cr</th>
+                  <th>bias_1h</th>
+                  <th>bias_15m</th>
+                  <th>avwap_signal</th>
+                </tr>
+              </thead>
+              <tbody>
             {% for r in data.get("results") %}
               {% set b1 = (r.get("bias_1h") or "")|upper %}
               {% set b15 = (r.get("bias_15m") or "")|upper %}
@@ -84,17 +93,19 @@
               {% set all_red = (c1 == "sig-red" and c2 == "sig-red" and c3 == "sig-red") %}
               <tr class="{{ 'row-green' if all_green else ('row-red' if all_red else '') }}">
                 <td>{{ r.get("symbol") }}</td>
-                <td>{{ r.get("close") }}</td>
-                <td>{{ r.get("volume_breakout") }}</td>
-                <td>{{ r.get("rsi") }}</td>
-                <td>{{ r.get("avg_turnover20_cr") }}</td>
+                <td class="num">{{ r.get("close") }}</td>
+                <td class="num">{{ r.get("volume_breakout") }}</td>
+                <td class="num">{{ r.get("rsi") }}</td>
+                <td class="num">{{ r.get("avg_turnover20_cr") }}</td>
                 <td class="{{ c1 }}">{{ r.get("bias_1h") }}</td>
                 <td class="{{ c2 }}">{{ r.get("bias_15m") }}</td>
                 <td class="{{ c3 }}">{{ r.get("avwap_signal") }}</td>
               </tr>
             {% endfor %}
-          </tbody>
-        </table>
+              </tbody>
+            </table>
+          </div>
+        </div>
       {% elif status in ["pending", "running"] %}
         <p>Scan is running…</p>
       {% elif status == "done" %}

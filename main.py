@@ -657,112 +657,60 @@ def scan_start() -> Any:
 # ---------------------------------------------------------------------------
 
 
-@app.get("/")
 @app.get("/ui")
 def ui_home() -> Any:
-    as_of = request.args.get("as_of", "").strip()
-    b = request.args.get("b", "").strip() or "1"
-    job_id = request.args.get("job_id", "").strip()
-
-    job: dict[str, Any] | None = None
-    if job_id:
-        job = _read_record_from_store(job_id) or _get_job(job_id)
+    as_of_raw = request.args.get("as_of", "").strip()
+    b_raw = request.args.get("b", "").strip() or "1"
+    start = str(request.args.get("start", "")).strip()
 
     # UI dropdown: show up to the stored limit (default 200)
     recent_jobs = _list_jobs_from_store(limit=_MAX_STORED_JOBS)
-    return render_template(
-        "ui.html",
-        as_of=as_of,
-        b=b,
-        job_id=job_id,
-        job=job,
-        recent_jobs=recent_jobs,
-    )
 
+    # Start scan directly from /ui by adding ?start=1
+    if start == "1":
+        args_payload: dict[str, Any] = {}
+        if as_of_raw:
+            args_payload["as_of"] = as_of_raw
+        if b_raw:
+            args_payload["b"] = b_raw
 
-@app.get("/ui/start")
-def ui_start() -> Any:
-    # Start scan with GET-friendly args (as_of, b)
-    args_payload: dict[str, Any] = {}
-    if request.args.get("as_of"):
-        args_payload["as_of"] = request.args.get("as_of")
-    if request.args.get("b"):
-        args_payload["b"] = request.args.get("b")
-
-    # Reuse the same logic as API start (but avoid calling the route function directly)
-    try:
-        config = _build_config({})
-        symbols = _resolve_symbols_from_payload(args_payload)
-        as_of = _as_of_from_payload(args_payload)
-        batch, limit, offset = _batch_params(args_payload)
-    except ValueError as exc:
-        return render_template("ui.html", as_of=args_payload.get("as_of", ""), b=args_payload.get("b", "1"), job=None, job_id="", recent_jobs=_list_jobs_from_store(limit=_MAX_STORED_JOBS), error=str(exc)), 400
-    except Exception as exc:
-        return (
-            render_template(
-                "ui.html",
-                as_of=args_payload.get("as_of", ""),
-                b=args_payload.get("b", "1"),
-                job=None,
-                job_id="",
-                recent_jobs=_list_jobs_from_store(limit=_MAX_STORED_JOBS),
-                error=f"Failed to start scan: {exc}",
-            ),
-            500,
-        )
-
-    try:
-        job_id = _create_job_with_batch(batch=batch, as_of=as_of.isoformat() if as_of else None)
-    except Exception as exc:
-        return (
-            render_template(
-                "ui.html",
-                as_of=args_payload.get("as_of", ""),
-                b=args_payload.get("b", "1"),
-                job=None,
-                job_id="",
-                recent_jobs=_list_jobs_from_store(limit=_MAX_STORED_JOBS),
-                error=f"Failed to start scan (persistence not configured): {exc}",
-            ),
-            500,
-        )
-    _update_job(job_id, batch=batch, limit=limit, offset=offset, total_in_chunk=len(symbols))
-    if _sb_enabled():
         try:
-            _sb_update_job(job_id, {"status": "running", "started_at": datetime.utcnow().isoformat()})
+            config = _build_config({})
+            symbols = _resolve_symbols_from_payload(args_payload)
+            as_of = _as_of_from_payload(args_payload)
+            batch, limit, offset = _batch_params(args_payload)
+            job_id = _create_job_with_batch(batch=batch, as_of=as_of.isoformat() if as_of else None)
+            _update_job(job_id, batch=batch, limit=limit, offset=offset, total_in_chunk=len(symbols))
+            if _sb_enabled():
+                _sb_update_job(job_id, {"status": "running", "started_at": datetime.utcnow().isoformat()})
+            t = threading.Thread(target=_run_scan_job, args=(job_id, symbols, config, as_of), daemon=True)
+            t.start()
+            return redirect(url_for("ui_job", job_id=job_id))
         except Exception as exc:
             return (
                 render_template(
                     "ui.html",
-                    as_of=args_payload.get("as_of", ""),
-                    b=args_payload.get("b", "1"),
+                    as_of=as_of_raw,
+                    b=b_raw,
                     job=None,
                     job_id="",
-                    recent_jobs=_list_jobs_from_store(limit=_MAX_STORED_JOBS),
-                    error=f"Supabase update failed (job created as {job_id}): {exc}",
+                    recent_jobs=recent_jobs,
+                    error=f"Failed to start scan: {exc}",
                 ),
                 500,
             )
-    try:
-        t = threading.Thread(target=_run_scan_job, args=(job_id, symbols, config, as_of), daemon=True)
-        t.start()
-    except Exception as exc:
-        # Still redirect to the job page (job_id exists); user can see status/poll later.
-        logging.exception("Failed to start background scan thread for job %s: %s", job_id, exc)
 
-    return redirect(url_for("ui_job", job_id=job_id))
-
-
-@app.get("/ui/job")
-def ui_job_picker() -> Any:
-    job_id = request.args.get("job_id", "").strip()
-    if not job_id:
-        return redirect(url_for("ui_home"))
-    return redirect(url_for("ui_job", job_id=job_id))
+    return render_template(
+        "ui.html",
+        as_of=as_of_raw,
+        b=b_raw,
+        job=None,
+        job_id="",
+        recent_jobs=recent_jobs,
+    )
 
 
 @app.get("/ui/<job_id>")
-@app.get("/ui/job/<job_id>")
 def ui_job(job_id: str) -> Any:
     if _sb_enabled():
         row = _sb_get_job(job_id)
