@@ -19,6 +19,37 @@ app = Flask(__name__)
 
 setup_logging(level=logging.INFO)
 
+@app.errorhandler(Exception)
+def _handle_unexpected_error(exc: Exception):  # type: ignore[override]
+    logging.exception("Unhandled exception on %s %s: %s", request.method, request.path, exc)
+    # For API routes, return JSON so we can debug easily.
+    if request.path.startswith("/api/"):
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "message": "Internal server error.",
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                    "path": request.path,
+                }
+            ),
+            500,
+        )
+    # For UI routes, show a simple error string (avoid exposing secrets).
+    return (
+        render_template(
+            "ui.html",
+            as_of=request.args.get("as_of", ""),
+            b=request.args.get("b", "1"),
+            job=None,
+            job_id="",
+            recent_jobs=_list_jobs_from_store(limit=_MAX_STORED_JOBS),
+            error=f"Internal error: {type(exc).__name__}: {exc}",
+        ),
+        500,
+    )
+
 
 # ---------------------------------------------------------------------------
 # In-memory async job store  (lives as long as the process, single-worker)
