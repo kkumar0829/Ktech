@@ -297,6 +297,9 @@ def _create_job_with_batch(*, batch: int, as_of: str | None) -> str:
 
 def _update_job(job_id: str, **kwargs: Any) -> None:
     with _jobs_lock:
+        # Supabase creates the numeric job id; ensure we have an in-memory entry too.
+        if job_id not in _jobs:
+            _jobs[job_id] = {"status": "pending", "created_at": datetime.utcnow().isoformat()}
         _jobs[job_id].update(kwargs)
 
 
