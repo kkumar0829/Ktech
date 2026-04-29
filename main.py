@@ -9,6 +9,7 @@ from typing import Any
 
 from flask import Flask, jsonify, request, render_template, redirect, url_for
 import requests
+from zoneinfo import ZoneInfo
 
 from scanner.config import ScannerConfig
 from scanner.logger import setup_logging
@@ -212,6 +213,10 @@ def _format_job_label(job_id: str, batch: str | None, ts_iso: str | None) -> str
         return f"{job_id} ({batch})" if batch else str(job_id)
     try:
         dt = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            # treat naive as UTC
+            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+        dt = dt.astimezone(ZoneInfo("Asia/Kolkata"))
         # dd-mm h:mm am/pm
         label = dt.strftime("%d-%m %I:%M %p").lower()
         # strip leading zero from hour (e.g. 02:07 -> 2:07)
