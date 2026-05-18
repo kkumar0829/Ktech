@@ -44,6 +44,134 @@ def _without_proxy_env():
             os.environ[k] = v
 
 
+_REQUIRED_COLS = {"Open", "High", "Low", "Close", "Volume"}
+# yfinance batch size; tune via SCAN_BATCH_SIZE on the scanner side.
+_DEFAULT_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "80"))
+
+
+def _normalize_ohlcv_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = out.columns.get_level_values(0)
+    if not _REQUIRED_COLS.issubset(out.columns):
+        return pd.DataFrame()
+    return out.dropna().copy()
+
+
+def _split_batch_download(raw: pd.DataFrame, clean_symbols: list[str]) -> dict[str, pd.DataFrame]:
+    """Split a multi-ticker yfinance download into per-symbol frames."""
+    empty = {s: pd.DataFrame() for s in clean_symbols}
+    if raw.empty or not clean_symbols:
+        return empty
+
+    tickers = [to_nse_symbol(s) for s in clean_symbols]
+    if len(clean_symbols) == 1:
+        empty[clean_symbols[0]] = _normalize_ohlcv_frame(raw)
+        return empty
+
+    if not isinstance(raw.columns, pd.MultiIndex):
+        # Unexpected shape — assign whole frame to first symbol only.
+        empty[clean_symbols[0]] = _normalize_ohlcv_frame(raw)
+        return empty
+
+    level0 = set(raw.columns.get_level_values(0))
+    for sym, tic in zip(clean_symbols, tickers):
+        if tic in level0:
+            empty[sym] = _normalize_ohlcv_frame(raw[tic])
+        else:
+            # Some yfinance builds use symbol without exchange suffix as key.
+            base = sym
+            if base in level0:
+                empty[sym] = _normalize_ohlcv_frame(raw[base])
+    return empty
+
+
+def _download_batch(
+    clean_symbols: list[str],
+    *,
+    period: str | None = None,
+    interval: str = "1d",
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> dict[str, pd.DataFrame]:
+    if not clean_symbols:
+        return {}
+    tickers = [to_nse_symbol(s) for s in clean_symbols]
+    kwargs: dict = {
+        "tickers": tickers if len(tickers) > 1 else tickers[0],
+        "interval": interval,
+        "auto_adjust": False,
+        "progress": False,
+        "threads": True,
+    }
+    if period is not None:
+        kwargs["period"] = period
+    else:
+        kwargs["start"] = start
+        kwargs["end"] = end
+    if len(tickers) > 1:
+        kwargs["group_by"] = "ticker"
+
+    try:
+        with _without_proxy_env():
+            raw = yf.download(**kwargs)
+    except Exception as exc:
+        logger.exception("Batch download failed (%s symbols, %s): %s", len(clean_symbols), interval, exc)
+        return {s: pd.DataFrame() for s in clean_symbols}
+
+    return _split_batch_download(raw, clean_symbols)
+
+
+def fetch_ohlcv_batch_daily(symbols: list[str], lookback_days: int, *, chunk_size: int | None = None) -> dict[str, pd.DataFrame]:
+    """Fetch daily OHLCV for many symbols in few yfinance calls."""
+    size = chunk_size or _DEFAULT_BATCH_SIZE
+    out: dict[str, pd.DataFrame] = {}
+    for i in range(0, len(symbols), size):
+        chunk = symbols[i : i + size]
+        out.update(_download_batch(chunk, period=f"{lookback_days}d", interval="1d"))
+    return out
+
+
+def fetch_ohlcv_batch_interval(
+    symbols: list[str],
+    period: str,
+    interval: str,
+    *,
+    chunk_size: int | None = None,
+) -> dict[str, pd.DataFrame]:
+    size = chunk_size or _DEFAULT_BATCH_SIZE
+    out: dict[str, pd.DataFrame] = {}
+    for i in range(0, len(symbols), size):
+        chunk = symbols[i : i + size]
+        out.update(_download_batch(chunk, period=period, interval=interval))
+    return out
+
+
+def fetch_ohlcv_batch_range(
+    symbols: list[str],
+    start: datetime,
+    end: datetime,
+    interval: str,
+    *,
+    chunk_size: int | None = None,
+    trim_before: datetime | None = None,
+) -> dict[str, pd.DataFrame]:
+    size = chunk_size or _DEFAULT_BATCH_SIZE
+    out: dict[str, pd.DataFrame] = {}
+    for i in range(0, len(symbols), size):
+        chunk = symbols[i : i + size]
+        chunk_map = _download_batch(chunk, interval=interval, start=start, end=end)
+        if trim_before is not None:
+            for sym, df in chunk_map.items():
+                if not df.empty:
+                    idx = pd.to_datetime(df.index)
+                    chunk_map[sym] = df.loc[idx < trim_before].copy()
+        out.update(chunk_map)
+    return out
+
+
 def fetch_ohlcv(symbol: str, lookback_days: int) -> pd.DataFrame:
     return fetch_ohlcv_interval(symbol=symbol, period=f"{lookback_days}d", interval="1d")
 
@@ -98,8 +226,7 @@ def fetch_ohlcv_range(symbol: str, start: datetime, end: datetime, interval: str
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    required_cols = {"Open", "High", "Low", "Close", "Volume"}
-    if not required_cols.issubset(df.columns):
+    if not _REQUIRED_COLS.issubset(df.columns):
         logger.error(
             "Missing required columns for %s (%s..%s/%s). Found: %s",
             ticker,
@@ -146,8 +273,7 @@ def fetch_ohlcv_interval(symbol: str, period: str, interval: str) -> pd.DataFram
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    required_cols = {"Open", "High", "Low", "Close", "Volume"}
-    if not required_cols.issubset(df.columns):
+    if not _REQUIRED_COLS.issubset(df.columns):
         logger.error(
             "Missing required columns for %s (%s/%s). Found: %s",
             ticker,

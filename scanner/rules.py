@@ -11,7 +11,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterable, List, Literal, Sequence
 
 import pandas as pd
@@ -19,10 +19,10 @@ from ta.momentum import RSIIndicator
 
 from scanner.config import ScannerConfig
 from scanner.data_fetcher import (
-    fetch_ohlcv,
-    fetch_ohlcv_asof,
-    fetch_ohlcv_interval,
-    fetch_ohlcv_range,
+    _DEFAULT_BATCH_SIZE,
+    fetch_ohlcv_batch_daily,
+    fetch_ohlcv_batch_interval,
+    fetch_ohlcv_batch_range,
 )
 
 logger = logging.getLogger(__name__)
@@ -412,9 +412,9 @@ def analyze_smc_fvg(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def scan_symbols(symbols: Iterable[str], config: ScannerConfig, *, as_of: date | None = None) -> List[ScanResult]:
-    results: List[ScanResult] = []
     symbol_list = list(symbols)
     total = len(symbol_list)
+    batch_size = int(os.getenv("SCAN_BATCH_SIZE", str(_DEFAULT_BATCH_SIZE)))
 
     as_of_end: datetime | None = None
     if as_of is not None:
@@ -426,15 +426,33 @@ def scan_symbols(symbols: Iterable[str], config: ScannerConfig, *, as_of: date |
         if cs:
             clean_symbols.append(cs)
 
-    def _scan_one(clean_symbol: str) -> ScanResult | None:
-        # Fetch daily OHLCV
-        if as_of is None:
-            raw_df = fetch_ohlcv(clean_symbol, config.lookback_days)
-        else:
-            raw_df = fetch_ohlcv_asof(clean_symbol, config.lookback_days, as_of, interval="1d")
-        if raw_df.empty:
-            return None
+    if not clean_symbols:
+        return []
 
+    # Phase 1: batched daily downloads (~10 HTTP calls per 950 symbols vs ~950).
+    logger.info("Phase 1: batch daily fetch for %d symbols (chunk=%d)", len(clean_symbols), batch_size)
+    if as_of is None:
+        daily_map = fetch_ohlcv_batch_daily(clean_symbols, config.lookback_days, chunk_size=batch_size)
+    else:
+        assert as_of_end is not None
+        start_dt = as_of_end - timedelta(days=int(config.lookback_days) + 10)
+        daily_map = fetch_ohlcv_batch_range(
+            clean_symbols,
+            start_dt,
+            as_of_end,
+            "1d",
+            chunk_size=batch_size,
+            trim_before=as_of_end,
+        )
+
+    # Phase 2: evaluate momentum on downloaded data (CPU only).
+    pending: list[tuple[str, ScanResult, pd.DataFrame]] = []
+    for idx, sym in enumerate(clean_symbols, start=1):
+        if idx % 100 == 0 or idx == len(clean_symbols):
+            logger.info("Phase 2: evaluated %d/%d", idx, len(clean_symbols))
+        raw_df = daily_map.get(sym, pd.DataFrame())
+        if raw_df.empty:
+            continue
         enriched_df = add_indicators(
             raw_df,
             ma_window=config.ma_window,
@@ -442,60 +460,63 @@ def scan_symbols(symbols: Iterable[str], config: ScannerConfig, *, as_of: date |
             breakout_window=config.breakout_window,
             rsi_window=config.rsi_window,
         )
-        result = evaluate_symbol(clean_symbol, enriched_df, config)
+        result = evaluate_symbol(sym, enriched_df, config)
         if not result:
-            return None
-
-        # AVWAP swing signal — informational, not used as a filter
+            continue
         try:
             result.avwap_signal = compute_avwap_signal(raw_df)
         except Exception as exc:
-            logger.warning("Failed to compute AVWAP signal for %s: %s", clean_symbol, exc)
+            logger.warning("Failed to compute AVWAP signal for %s: %s", sym, exc)
+        pending.append((sym, result, raw_df))
 
-        # Intraday bias only for matched symbols (still can be expensive but count is small)
-        try:
-            if as_of_end is None:
-                df_1h = fetch_ohlcv_interval(clean_symbol, period="30d", interval="60m")
-                df_15m = fetch_ohlcv_interval(clean_symbol, period="10d", interval="15m")
-            else:
-                df_1h = fetch_ohlcv_range(clean_symbol, start=as_of_end - timedelta(days=30), end=as_of_end, interval="60m")
-                df_15m = fetch_ohlcv_range(clean_symbol, start=as_of_end - timedelta(days=10), end=as_of_end, interval="15m")
-            result.bias_1h = bias_from_ohlc_df(df_1h, timeframe="1H")
-            result.bias_15m = bias_from_ohlc_df(df_15m, timeframe="15M")
-        except Exception as exc:
-            logger.warning("Failed to compute SMC bias for %s: %s", clean_symbol, exc)
+    if not pending:
+        return []
 
-        return result
+    # Phase 3: batched intraday for matches only.
+    match_symbols = [p[0] for p in pending]
+    logger.info("Phase 3: intraday bias for %d matches", len(match_symbols))
 
-    # Parallelize daily fetches to cut wall-clock time.
-    # Keep worker count conservative to reduce Yahoo throttling.
-    max_workers = min(12, max(4, (os.cpu_count() or 4)))
+    def _fetch_intraday_maps() -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+        if as_of_end is None:
+            h1 = fetch_ohlcv_batch_interval(match_symbols, "30d", "60m", chunk_size=batch_size)
+            m15 = fetch_ohlcv_batch_interval(match_symbols, "10d", "15m", chunk_size=batch_size)
+        else:
+            h1 = fetch_ohlcv_batch_range(
+                match_symbols,
+                as_of_end - timedelta(days=30),
+                as_of_end,
+                "60m",
+                chunk_size=batch_size,
+                trim_before=as_of_end,
+            )
+            m15 = fetch_ohlcv_batch_range(
+                match_symbols,
+                as_of_end - timedelta(days=10),
+                as_of_end,
+                "15m",
+                chunk_size=batch_size,
+                trim_before=as_of_end,
+            )
+        return h1, m15
+
     try:
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            future_map = {ex.submit(_scan_one, cs): cs for cs in clean_symbols}
-            done_count = 0
-            for fut in as_completed(future_map):
-                cs = future_map[fut]
-                done_count += 1
-                if done_count % 50 == 0 or done_count == total:
-                    logger.info("Scanned %d/%d", done_count, total)
-                try:
-                    r = fut.result()
-                    if r:
-                        results.append(r)
-                except Exception as exc:
-                    logger.exception("Unhandled error while scanning %s: %s", cs, exc)
-    except Exception:
-        # Fallback to sequential in case the executor fails in some envs
-        for idx, cs in enumerate(clean_symbols, start=1):
-            logger.info("Scanning %d/%d: %s", idx, total, cs)
-            try:
-                r = _scan_one(cs)
-                if r:
-                    results.append(r)
-            except Exception as exc:
-                logger.exception("Unhandled error while scanning %s: %s", cs, exc)
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            fut = ex.submit(_fetch_intraday_maps)
+            h1_map, m15_map = fut.result()
+    except Exception as exc:
+        logger.warning("Batched intraday fetch failed, falling back to empty bias: %s", exc)
+        h1_map, m15_map = {}, {}
 
+    results: List[ScanResult] = []
+    for sym, result, _raw_df in pending:
+        try:
+            result.bias_1h = bias_from_ohlc_df(h1_map.get(sym, pd.DataFrame()), timeframe="1H")
+            result.bias_15m = bias_from_ohlc_df(m15_map.get(sym, pd.DataFrame()), timeframe="15M")
+        except Exception as exc:
+            logger.warning("Failed to compute SMC bias for %s: %s", sym, exc)
+        results.append(result)
+
+    logger.info("Scan complete: %d matches from %d symbols", len(results), total)
     return rank_results(results)
 
 
