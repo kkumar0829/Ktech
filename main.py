@@ -3,7 +3,7 @@ import logging
 import threading
 import json
 from dataclasses import asdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from scanner.config import ScannerConfig
 from scanner.logger import setup_logging
 from scanner.symbol_loader import resolve_symbols
+from scanner.data_fetcher import fetch_last_close
 from scanner.rules import analyze_smc_fvg, results_to_dataframe, scan_symbols
 
 app = Flask(__name__)
@@ -65,6 +66,8 @@ _STATE_DIR = Path(os.getenv("STATE_DIR", Path(__file__).parent))
 _COUNTER_FILE = _STATE_DIR / "job_counter.txt"
 _RESULTS_STORE_FILE = _STATE_DIR / "scan_results_store.jsonl"  # newest-first JSONL, keep last 50
 _MAX_STORED_JOBS = int(os.getenv("MAX_STORED_JOBS", "200"))
+_TRADEBOOK_DEDUP_DAYS = int(os.getenv("TRADEBOOK_DEDUP_DAYS", "10"))
+_IST = ZoneInfo("Asia/Kolkata")
 
 # Supabase persistence (free-tier friendly if you use an external DB)
 _SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
@@ -87,6 +90,10 @@ def _sb_headers() -> dict[str, str]:
 
 def _sb_table_url() -> str:
     return f"{_SUPABASE_URL.rstrip('/')}/rest/v1/scan_jobs"
+
+
+def _sb_tradebook_table_url() -> str:
+    return f"{_SUPABASE_URL.rstrip('/')}/rest/v1/tradebook"
 
 
 def _sb_create_job(*, batch: int, as_of: str | None) -> str:
@@ -147,6 +154,120 @@ def _sb_list_jobs(limit: int = 50) -> list[dict[str, Any]]:
     )
     r.raise_for_status()
     return r.json() or []
+
+
+def _sb_tradebook_symbols_since(cutoff: date) -> set[str]:
+    r = requests.get(
+        _sb_tradebook_table_url(),
+        headers=_sb_headers(),
+        params={
+            "select": "symbol",
+            "entry_date": f"gte.{cutoff.isoformat()}",
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    return {str(row["symbol"]).strip().upper() for row in (r.json() or []) if row.get("symbol")}
+
+
+def _sb_tradebook_insert_many(rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    r = requests.post(
+        _sb_tradebook_table_url(),
+        headers={**_sb_headers(), "Prefer": "return=minimal"},
+        data=json.dumps(rows),
+        timeout=30,
+    )
+    r.raise_for_status()
+
+
+def _sb_tradebook_list(*, limit: int = 200) -> list[dict[str, Any]]:
+    r = requests.get(
+        _sb_tradebook_table_url(),
+        headers=_sb_headers(),
+        params={
+            "select": "id,symbol,entry_date,entry_price,entry_at,source_job_id,current_price,pnl_pct,updated_at",
+            "order": "entry_date.desc,id.desc",
+            "limit": str(limit),
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json() or []
+
+
+def _sb_tradebook_update(row_id: int, patch: dict[str, Any]) -> None:
+    r = requests.patch(
+        _sb_tradebook_table_url(),
+        headers=_sb_headers(),
+        params={"id": f"eq.{row_id}"},
+        data=json.dumps(patch),
+        timeout=20,
+    )
+    r.raise_for_status()
+
+
+def _tradebook_qualifies(row: dict[str, Any]) -> bool:
+    bias = str(row.get("bias_1h", "")).strip().upper()
+    avwap = str(row.get("avwap_signal", "")).strip().upper()
+    return bias == "BULLISH" and avwap == "BUY"
+
+
+def _entry_date_for_scan(as_of: date | None) -> date:
+    if as_of:
+        return as_of
+    return datetime.now(_IST).date()
+
+
+def _populate_tradebook_from_scan(
+    job_id: str,
+    result_rows: list[dict[str, Any]],
+    *,
+    as_of: date | None,
+    finished_at: str,
+) -> dict[str, int]:
+    """Insert qualifying scan rows into tradebook (first price wins within dedup window)."""
+    if not _sb_enabled():
+        return {"inserted": 0, "skipped": 0}
+
+    cutoff = datetime.now(_IST).date() - timedelta(days=_TRADEBOOK_DEDUP_DAYS)
+    recent_symbols = _sb_tradebook_symbols_since(cutoff)
+    entry_date = _entry_date_for_scan(as_of)
+
+    to_insert: list[dict[str, Any]] = []
+    skipped = 0
+    job_id_int = int(job_id) if str(job_id).isdigit() else None
+
+    for row in result_rows:
+        if not _tradebook_qualifies(row):
+            continue
+        symbol = str(row.get("symbol", "")).strip().upper()
+        if not symbol:
+            continue
+        if symbol in recent_symbols:
+            skipped += 1
+            continue
+        close = row.get("close")
+        if close is None:
+            skipped += 1
+            continue
+
+        to_insert.append(
+            {
+                "symbol": symbol,
+                "entry_date": entry_date.isoformat(),
+                "entry_price": round(float(close), 2),
+                "entry_at": finished_at,
+                "source_job_id": job_id_int,
+            }
+        )
+        recent_symbols.add(symbol)
+
+    if to_insert:
+        _sb_tradebook_insert_many(to_insert)
+
+    return {"inserted": len(to_insert), "skipped": skipped}
 
 
 def _ensure_state_dir() -> None:
@@ -463,7 +584,8 @@ def _run_scan_job(job_id: str, symbols: list[str], config: ScannerConfig, as_of:
             "limit": job_snapshot.get("limit"),
             "offset": job_snapshot.get("offset"),
         }
-        _update_job(job_id, status="done", finished_at=datetime.utcnow().isoformat(), data=data)
+        finished_at = datetime.utcnow().isoformat()
+        _update_job(job_id, status="done", finished_at=finished_at, data=data)
 
         if _sb_enabled():
             try:
@@ -471,11 +593,26 @@ def _run_scan_job(job_id: str, symbols: list[str], config: ScannerConfig, as_of:
                     job_id,
                     {
                         "status": "done",
-                        "finished_at": datetime.utcnow().isoformat(),
+                        "finished_at": finished_at,
                         "result": data,
                         "error": None,
                     },
                 )
+                try:
+                    tb_stats = _populate_tradebook_from_scan(
+                        job_id,
+                        result_rows,
+                        as_of=as_of,
+                        finished_at=finished_at,
+                    )
+                    logging.info(
+                        "[job:%s] Tradebook populated: inserted=%d skipped=%d",
+                        job_id,
+                        tb_stats.get("inserted", 0),
+                        tb_stats.get("skipped", 0),
+                    )
+                except Exception as tb_exc:
+                    logging.warning("[job:%s] Tradebook populate failed: %s", job_id, tb_exc)
                 # keep last N in DB
                 # (do best-effort cleanup; not critical if it fails)
                 rows = _sb_list_jobs(limit=5000)
@@ -853,6 +990,81 @@ def scan_status(job_id: str) -> Any:
         ),
         202,
     )
+
+
+@app.get("/api/v1/tradebook")
+def tradebook() -> Any:
+    """Live PnL% for open tradebook rows (updates current_price / pnl_pct in Supabase)."""
+    if not _sb_enabled():
+        return jsonify({"success": False, "message": "Supabase is required for tradebook."}), 400
+
+    try:
+        limit = min(500, max(1, int(request.args.get("limit", "200"))))
+    except ValueError:
+        return jsonify({"success": False, "message": "limit must be an integer."}), 400
+
+    try:
+        rows = _sb_tradebook_list(limit=limit)
+    except Exception as exc:
+        logging.exception("Failed to load tradebook: %s", exc)
+        return jsonify({"success": False, "message": "Failed to load tradebook.", "error": str(exc)}), 500
+
+    now_iso = datetime.now(_IST).isoformat()
+    trades: list[dict[str, Any]] = []
+
+    for row in rows:
+        symbol = str(row.get("symbol", "")).strip().upper()
+        entry_price = float(row["entry_price"])
+        current_price: float | None = None
+        pnl_pct: float | None = None
+
+        try:
+            current_price = fetch_last_close(symbol)
+        except Exception as exc:
+            logging.warning("Failed to fetch price for %s: %s", symbol, exc)
+
+        if current_price is not None and entry_price:
+            pnl_pct = round((current_price - entry_price) / entry_price * 100, 2)
+            current_price = round(current_price, 2)
+
+        row_id = row.get("id")
+        if row_id is not None and current_price is not None:
+            try:
+                _sb_tradebook_update(
+                    int(row_id),
+                    {
+                        "current_price": current_price,
+                        "pnl_pct": pnl_pct,
+                        "updated_at": now_iso,
+                    },
+                )
+            except Exception as exc:
+                logging.warning("Failed to update tradebook row %s: %s", row_id, exc)
+
+        entry_date = row.get("entry_date")
+        days_open = None
+        if entry_date:
+            try:
+                ed = date.fromisoformat(str(entry_date)[:10])
+                days_open = (datetime.now(_IST).date() - ed).days
+            except Exception:
+                pass
+
+        trades.append(
+            {
+                "id": row_id,
+                "symbol": symbol,
+                "entry_date": entry_date,
+                "entry_price": entry_price,
+                "entry_at": row.get("entry_at"),
+                "source_job_id": row.get("source_job_id"),
+                "current_price": current_price,
+                "pnl_pct": pnl_pct,
+                "days_open": days_open,
+            }
+        )
+
+    return jsonify({"success": True, "as_of_now": now_iso, "count": len(trades), "trades": trades}), 200
 
 
 @app.post("/api/v1/smc/fvg")

@@ -158,3 +158,14 @@ def fetch_ohlcv_interval(symbol: str, period: str, interval: str) -> pd.DataFram
         return pd.DataFrame()
 
     return df.dropna().copy()
+
+
+def fetch_last_close(symbol: str) -> float | None:
+    """Latest daily close for a symbol (used for tradebook PnL)."""
+    df = fetch_ohlcv_interval(symbol=symbol, period="5d", interval="1d")
+    if df.empty:
+        return None
+    try:
+        return float(df["Close"].iloc[-1])
+    except Exception:
+        return None
