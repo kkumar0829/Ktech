@@ -1,5 +1,6 @@
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 
@@ -46,7 +47,10 @@ def _without_proxy_env():
 
 _REQUIRED_COLS = {"Open", "High", "Low", "Close", "Volume"}
 # yfinance batch size; tune via SCAN_BATCH_SIZE on the scanner side.
-_DEFAULT_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "80"))
+_DEFAULT_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "40"))
+_BATCH_TIMEOUT_SEC = int(os.getenv("SCAN_BATCH_TIMEOUT_SEC", "90"))
+# Intraday (60m/15m) payloads are large — keep batches smaller.
+_INTRADAY_BATCH_SIZE = int(os.getenv("SCAN_INTRADAY_BATCH_SIZE", "15"))
 
 
 def _normalize_ohlcv_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -72,20 +76,79 @@ def _split_batch_download(raw: pd.DataFrame, clean_symbols: list[str]) -> dict[s
         return empty
 
     if not isinstance(raw.columns, pd.MultiIndex):
-        # Unexpected shape — assign whole frame to first symbol only.
         empty[clean_symbols[0]] = _normalize_ohlcv_frame(raw)
         return empty
 
     level0 = set(raw.columns.get_level_values(0))
+    level1 = set(raw.columns.get_level_values(1)) if raw.columns.nlevels > 1 else set()
+
     for sym, tic in zip(clean_symbols, tickers):
+        key = None
         if tic in level0:
-            empty[sym] = _normalize_ohlcv_frame(raw[tic])
-        else:
-            # Some yfinance builds use symbol without exchange suffix as key.
-            base = sym
-            if base in level0:
-                empty[sym] = _normalize_ohlcv_frame(raw[base])
+            key = tic
+        elif sym in level0:
+            key = sym
+        elif tic in level1:
+            # (Price, Ticker) column order — select by ticker on level 1.
+            try:
+                empty[sym] = _normalize_ohlcv_frame(raw.xs(tic, axis=1, level=1))
+                continue
+            except Exception:
+                pass
+        elif sym in level1:
+            try:
+                empty[sym] = _normalize_ohlcv_frame(raw.xs(sym, axis=1, level=1))
+                continue
+            except Exception:
+                pass
+        if key is not None:
+            try:
+                empty[sym] = _normalize_ohlcv_frame(raw[key])
+            except Exception:
+                pass
     return empty
+
+
+def _yf_download(clean_symbols: list[str], *, period: str | None, interval: str, start, end) -> pd.DataFrame:
+    tickers = [to_nse_symbol(s) for s in clean_symbols]
+    kwargs: dict = {
+        "tickers": tickers if len(tickers) > 1 else tickers[0],
+        "interval": interval,
+        "auto_adjust": False,
+        "progress": False,
+        "threads": False,
+    }
+    if period is not None:
+        kwargs["period"] = period
+    else:
+        kwargs["start"] = start
+        kwargs["end"] = end
+    if len(tickers) > 1:
+        kwargs["group_by"] = "ticker"
+    with _without_proxy_env():
+        return yf.download(**kwargs)
+
+
+def _fetch_symbols_individually(
+    clean_symbols: list[str],
+    *,
+    period: str | None,
+    interval: str,
+    start: datetime | None,
+    end: datetime | None,
+) -> dict[str, pd.DataFrame]:
+    out: dict[str, pd.DataFrame] = {}
+    for sym in clean_symbols:
+        try:
+            if period is not None:
+                df = fetch_ohlcv_interval(sym, period, interval)
+            else:
+                df = fetch_ohlcv_range(sym, start, end, interval)
+            out[sym] = df
+        except Exception as exc:
+            logger.warning("Individual fetch failed for %s: %s", sym, exc)
+            out[sym] = pd.DataFrame()
+    return out
 
 
 def _download_batch(
@@ -95,33 +158,49 @@ def _download_batch(
     interval: str = "1d",
     start: datetime | None = None,
     end: datetime | None = None,
+    timeout_sec: int | None = None,
 ) -> dict[str, pd.DataFrame]:
     if not clean_symbols:
         return {}
-    tickers = [to_nse_symbol(s) for s in clean_symbols]
-    kwargs: dict = {
-        "tickers": tickers if len(tickers) > 1 else tickers[0],
-        "interval": interval,
-        "auto_adjust": False,
-        "progress": False,
-        "threads": True,
-    }
-    if period is not None:
-        kwargs["period"] = period
-    else:
-        kwargs["start"] = start
-        kwargs["end"] = end
-    if len(tickers) > 1:
-        kwargs["group_by"] = "ticker"
+
+    timeout = timeout_sec if timeout_sec is not None else _BATCH_TIMEOUT_SEC
+
+    def _run_batch() -> dict[str, pd.DataFrame]:
+        try:
+            raw = _yf_download(clean_symbols, period=period, interval=interval, start=start, end=end)
+            return _split_batch_download(raw, clean_symbols)
+        except Exception as exc:
+            logger.exception("Batch download failed (%s symbols, %s): %s", len(clean_symbols), interval, exc)
+            return {s: pd.DataFrame() for s in clean_symbols}
 
     try:
-        with _without_proxy_env():
-            raw = yf.download(**kwargs)
-    except Exception as exc:
-        logger.exception("Batch download failed (%s symbols, %s): %s", len(clean_symbols), interval, exc)
-        return {s: pd.DataFrame() for s in clean_symbols}
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_run_batch)
+            result = fut.result(timeout=timeout)
+    except FuturesTimeoutError:
+        logger.error(
+            "Batch download timed out after %ss (%s symbols, %s) — falling back to per-symbol",
+            timeout,
+            len(clean_symbols),
+            interval,
+        )
+        result = _fetch_symbols_individually(
+            clean_symbols, period=period, interval=interval, start=start, end=end
+        )
+        return result
 
-    return _split_batch_download(raw, clean_symbols)
+    nonempty = sum(1 for s in clean_symbols if not result.get(s, pd.DataFrame()).empty)
+    if nonempty < max(1, len(clean_symbols) // 4):
+        logger.warning(
+            "Batch download sparse (%d/%s ok, %s) — falling back to per-symbol",
+            nonempty,
+            len(clean_symbols),
+            interval,
+        )
+        return _fetch_symbols_individually(
+            clean_symbols, period=period, interval=interval, start=start, end=end
+        )
+    return result
 
 
 def fetch_ohlcv_batch_daily(symbols: list[str], lookback_days: int, *, chunk_size: int | None = None) -> dict[str, pd.DataFrame]:
@@ -130,6 +209,7 @@ def fetch_ohlcv_batch_daily(symbols: list[str], lookback_days: int, *, chunk_siz
     out: dict[str, pd.DataFrame] = {}
     for i in range(0, len(symbols), size):
         chunk = symbols[i : i + size]
+        logger.info("Daily batch %d-%d / %d", i + 1, min(i + size, len(symbols)), len(symbols))
         out.update(_download_batch(chunk, period=f"{lookback_days}d", interval="1d"))
     return out
 
@@ -141,7 +221,7 @@ def fetch_ohlcv_batch_interval(
     *,
     chunk_size: int | None = None,
 ) -> dict[str, pd.DataFrame]:
-    size = chunk_size or _DEFAULT_BATCH_SIZE
+    size = chunk_size or _INTRADAY_BATCH_SIZE
     out: dict[str, pd.DataFrame] = {}
     for i in range(0, len(symbols), size):
         chunk = symbols[i : i + size]

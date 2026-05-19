@@ -11,8 +11,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, Iterable, List, Literal, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Literal, Sequence
 
 import pandas as pd
 from ta.momentum import RSIIndicator
@@ -411,7 +410,13 @@ def analyze_smc_fvg(payload: dict[str, Any]) -> dict[str, Any]:
 # =========================
 
 
-def scan_symbols(symbols: Iterable[str], config: ScannerConfig, *, as_of: date | None = None) -> List[ScanResult]:
+def scan_symbols(
+    symbols: Iterable[str],
+    config: ScannerConfig,
+    *,
+    as_of: date | None = None,
+    on_progress: Callable[[str, dict[str, Any]], None] | None = None,
+) -> List[ScanResult]:
     symbol_list = list(symbols)
     total = len(symbol_list)
     batch_size = int(os.getenv("SCAN_BATCH_SIZE", str(_DEFAULT_BATCH_SIZE)))
@@ -429,8 +434,16 @@ def scan_symbols(symbols: Iterable[str], config: ScannerConfig, *, as_of: date |
     if not clean_symbols:
         return []
 
+    def _progress(phase: str, **extra: Any) -> None:
+        if on_progress:
+            try:
+                on_progress(phase, extra)
+            except Exception as exc:
+                logger.warning("on_progress callback failed: %s", exc)
+
     # Phase 1: batched daily downloads (~10 HTTP calls per 950 symbols vs ~950).
     logger.info("Phase 1: batch daily fetch for %d symbols (chunk=%d)", len(clean_symbols), batch_size)
+    _progress("daily_fetch", total=len(clean_symbols), chunk=batch_size)
     if as_of is None:
         daily_map = fetch_ohlcv_batch_daily(clean_symbols, config.lookback_days, chunk_size=batch_size)
     else:
@@ -445,6 +458,7 @@ def scan_symbols(symbols: Iterable[str], config: ScannerConfig, *, as_of: date |
             trim_before=as_of_end,
         )
 
+    _progress("evaluate", total=len(clean_symbols))
     # Phase 2: evaluate momentum on downloaded data (CPU only).
     pending: list[tuple[str, ScanResult, pd.DataFrame]] = []
     for idx, sym in enumerate(clean_symbols, start=1):
@@ -470,42 +484,37 @@ def scan_symbols(symbols: Iterable[str], config: ScannerConfig, *, as_of: date |
         pending.append((sym, result, raw_df))
 
     if not pending:
+        _progress("done", matches=0, scanned=len(clean_symbols))
         return []
 
-    # Phase 3: batched intraday for matches only.
+    # Phase 3: batched intraday for matches only (smaller chunks — 60m/15m are heavy).
     match_symbols = [p[0] for p in pending]
     logger.info("Phase 3: intraday bias for %d matches", len(match_symbols))
+    _progress("intraday_fetch", matches=len(match_symbols))
 
-    def _fetch_intraday_maps() -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+    h1_map: dict[str, pd.DataFrame] = {}
+    m15_map: dict[str, pd.DataFrame] = {}
+    try:
         if as_of_end is None:
-            h1 = fetch_ohlcv_batch_interval(match_symbols, "30d", "60m", chunk_size=batch_size)
-            m15 = fetch_ohlcv_batch_interval(match_symbols, "10d", "15m", chunk_size=batch_size)
+            h1_map = fetch_ohlcv_batch_interval(match_symbols, "30d", "60m")
+            m15_map = fetch_ohlcv_batch_interval(match_symbols, "10d", "15m")
         else:
-            h1 = fetch_ohlcv_batch_range(
+            h1_map = fetch_ohlcv_batch_range(
                 match_symbols,
                 as_of_end - timedelta(days=30),
                 as_of_end,
                 "60m",
-                chunk_size=batch_size,
                 trim_before=as_of_end,
             )
-            m15 = fetch_ohlcv_batch_range(
+            m15_map = fetch_ohlcv_batch_range(
                 match_symbols,
                 as_of_end - timedelta(days=10),
                 as_of_end,
                 "15m",
-                chunk_size=batch_size,
                 trim_before=as_of_end,
             )
-        return h1, m15
-
-    try:
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            fut = ex.submit(_fetch_intraday_maps)
-            h1_map, m15_map = fut.result()
     except Exception as exc:
         logger.warning("Batched intraday fetch failed, falling back to empty bias: %s", exc)
-        h1_map, m15_map = {}, {}
 
     results: List[ScanResult] = []
     for sym, result, _raw_df in pending:
@@ -517,6 +526,7 @@ def scan_symbols(symbols: Iterable[str], config: ScannerConfig, *, as_of: date |
         results.append(result)
 
     logger.info("Scan complete: %d matches from %d symbols", len(results), total)
+    _progress("done", matches=len(results), scanned=len(clean_symbols))
     return rank_results(results)
 
 

@@ -563,10 +563,14 @@ def _run_scan_job(job_id: str, symbols: list[str], config: ScannerConfig, as_of:
             _sb_update_job(job_id, {"status": "running", "started_at": datetime.utcnow().isoformat()})
         except Exception as exc:
             logging.warning("[job:%s] Supabase update failed (running): %s", job_id, exc)
+
+    def _on_progress(phase: str, extra: dict[str, Any]) -> None:
+        _update_job(job_id, progress={"phase": phase, **extra})
+
     try:
         job_snapshot = _get_job(job_id) or {}
         logging.info("[job:%s] Scanning %d symbols", job_id, len(symbols))
-        results = scan_symbols(symbols, config, as_of=as_of)
+        results = scan_symbols(symbols, config, as_of=as_of, on_progress=_on_progress)
         result_rows = results_to_dataframe(results).to_dict(orient="records")
 
         try:
@@ -588,33 +592,51 @@ def _run_scan_job(job_id: str, symbols: list[str], config: ScannerConfig, as_of:
         _update_job(job_id, status="done", finished_at=finished_at, data=data)
 
         if _sb_enabled():
+            done_patch = {
+                "status": "done",
+                "finished_at": finished_at,
+                "result": data,
+                "error": None,
+            }
             try:
-                _sb_update_job(
-                    job_id,
-                    {
-                        "status": "done",
-                        "finished_at": finished_at,
-                        "result": data,
-                        "error": None,
-                    },
-                )
+                _sb_update_job(job_id, done_patch)
+            except Exception as exc:
+                logging.warning("[job:%s] Supabase full result update failed: %s", job_id, exc)
+                # Still mark done so jobs don't stay stuck in running.
                 try:
-                    tb_stats = _populate_tradebook_from_scan(
+                    _sb_update_job(
                         job_id,
-                        result_rows,
-                        as_of=as_of,
-                        finished_at=finished_at,
+                        {
+                            "status": "done",
+                            "finished_at": finished_at,
+                            "error": None,
+                            "result": {
+                                "scanned_symbols": len(symbols),
+                                "matched_symbols": len(result_rows),
+                                "results": result_rows,
+                                "note": "Full payload stored in-memory; Supabase write was truncated.",
+                            },
+                        },
                     )
-                    logging.info(
-                        "[job:%s] Tradebook populated: inserted=%d skipped=%d",
-                        job_id,
-                        tb_stats.get("inserted", 0),
-                        tb_stats.get("skipped", 0),
-                    )
-                except Exception as tb_exc:
-                    logging.warning("[job:%s] Tradebook populate failed: %s", job_id, tb_exc)
-                # keep last N in DB
-                # (do best-effort cleanup; not critical if it fails)
+                except Exception as exc2:
+                    logging.warning("[job:%s] Supabase minimal done update failed: %s", job_id, exc2)
+            try:
+                tb_stats = _populate_tradebook_from_scan(
+                    job_id,
+                    result_rows,
+                    as_of=as_of,
+                    finished_at=finished_at,
+                )
+                logging.info(
+                    "[job:%s] Tradebook populated: inserted=%d skipped=%d",
+                    job_id,
+                    tb_stats.get("inserted", 0),
+                    tb_stats.get("skipped", 0),
+                )
+            except Exception as tb_exc:
+                logging.warning("[job:%s] Tradebook populate failed: %s", job_id, tb_exc)
+            # keep last N in DB (best-effort)
+            try:
                 rows = _sb_list_jobs(limit=5000)
                 if len(rows) > _MAX_STORED_JOBS:
                     cutoff = sorted([int(r["job_id"]) for r in rows], reverse=True)[_MAX_STORED_JOBS - 1]
@@ -625,7 +647,7 @@ def _run_scan_job(job_id: str, symbols: list[str], config: ScannerConfig, as_of:
                         timeout=20,
                     )
             except Exception as exc:
-                logging.warning("[job:%s] Supabase update failed (done): %s", job_id, exc)
+                logging.warning("[job:%s] Supabase job cleanup failed: %s", job_id, exc)
         else:
             _store_prepend_record(
                 {
@@ -771,7 +793,7 @@ def scan_start() -> Any:
             logging.exception("Supabase UPDATE failed for job %s: %s", job_id, exc)
             return jsonify({"success": False, "message": "Supabase update failed.", "job_id": job_id, "error": str(exc)}), 500
     try:
-        t = threading.Thread(target=_run_scan_job, args=(job_id, symbols, config, as_of), daemon=True)
+        t = threading.Thread(target=_run_scan_job, args=(job_id, symbols, config, as_of), daemon=False)
         t.start()
     except Exception as exc:
         # If the job row was already created in Supabase, do not fail the request with a 500.
@@ -825,7 +847,7 @@ def ui_home() -> Any:
             _update_job(job_id, batch=batch, limit=limit, offset=offset, total_in_chunk=len(symbols))
             if _sb_enabled():
                 _sb_update_job(job_id, {"status": "running", "started_at": datetime.utcnow().isoformat()})
-            t = threading.Thread(target=_run_scan_job, args=(job_id, symbols, config, as_of), daemon=True)
+            t = threading.Thread(target=_run_scan_job, args=(job_id, symbols, config, as_of), daemon=False)
             t.start()
             return redirect(url_for("ui_job", job_id=job_id))
         except Exception as exc:
